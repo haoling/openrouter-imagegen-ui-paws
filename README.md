@@ -12,6 +12,7 @@ paws is a private, self-hosted web interface for generating images via AI models
 - **Real-time Streaming**: Watch images materialize in real-time via streaming generation chunks.
 - **Persistent Settings**: Your chosen model, resolution, aspect ratio and prompt history are saved between sessions.
 - **Authentication**: Optional user/password authentication for added security.
+- **Google Drive**: Optional, serverless Google sign-in to connect a Drive folder for syncing.
 
 ### Generation Control
 - **Reference Images**: Attach up to 4 reference images to guide the generation (vision models).
@@ -86,6 +87,10 @@ authentication:
   users:
   - username: admin
     password: $2a$12$eH6Du2grC7aOUDmff2SrC.yKPWea/fq0d76c3JsvhGxhGCEOnWTRy
+
+google:
+  # oauth 2.0 client id for "Google Drive" integration (optional; leave empty to disable)
+  client-id: ""
 ```
 
 ## Authentication (optional)
@@ -101,6 +106,28 @@ authentication:
 ```
 
 After a successful login, paws issues a signed (HMAC-SHA256) token, using the server secret (`tokens.secret` in `config.yml`). This is stored as a cookie and re-used for future authentications.
+
+## Google Drive (optional)
+
+paws can optionally connect to Google Drive entirely client-side, using [Google Identity Services](https://developers.google.com/identity/oauth2/web/guides/overview) — no server-side OAuth client secret is required or stored.
+
+To enable it:
+
+1. Create an OAuth 2.0 Client ID in the [Google Cloud Console](https://console.cloud.google.com/apis/credentials) (Application type: `Web application`) and add the origin(s) paws is served on (e.g. `https://images.example.com`) to **Authorized JavaScript origins**.
+2. Set `google.client-id` in `config.yml` to that Client ID.
+
+```yaml
+google:
+  client-id: "your-client-id.apps.googleusercontent.com"
+```
+
+Once configured, a Google Drive button appears next to the usage display. Connecting requests the following, minimal set of permissions:
+
+- `drive.appdata` — read/write access to paws' own hidden, app-specific data folder.
+- `drive.file` — read/write access to a Drive folder you explicitly select.
+- `drive.metadata.readonly` — lets paws list your folders so you can pick one to sync to.
+
+The resulting access token is only ever held in the browser and is never sent to, or stored by, the paws server.
 
 ## Nginx (optional)
 

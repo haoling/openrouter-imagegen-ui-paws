@@ -24,3 +24,7 @@ authentication:
   users:
   - username: admin
     password: $2a$12$eH6Du2grC7aOUDmff2SrC.yKPWea/fq0d76c3JsvhGxhGCEOnWTRy
+
+google:
+  # oauth 2.0 client id for "Google Drive" integration (optional; leave empty to disable); create one at https://console.cloud.google.com/apis/credentials as a "Web application" client and add this server's origin to "Authorized JavaScript origins"
+  client-id: ""

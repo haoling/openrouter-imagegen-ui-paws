@@ -137,6 +137,44 @@ body {
 	color: var(--c-text);
 }
 
+.drive-btn {
+	margin-left: auto;
+	width: 30px;
+	height: 30px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: var(--c-surface0);
+	border: 1px solid var(--c-surface1);
+	border-radius: 2px;
+	color: var(--c-subtext0);
+	cursor: pointer;
+	transition:
+		background 0.2s,
+		color 0.2s,
+		border-color 0.2s;
+}
+
+.drive-btn:hover {
+	background: var(--c-surface1);
+	border-color: var(--c-surface2);
+	color: var(--c-text);
+}
+
+.drive-btn + .usage-display {
+	margin-left: 0;
+}
+
+.drive-status {
+	font-size: 14px;
+	color: var(--c-subtext0);
+	margin-bottom: 14px;
+}
+
+.drive-status.connected {
+	color: var(--c-green);
+}
+
 .usage-display {
 	margin-left: auto;
 	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;

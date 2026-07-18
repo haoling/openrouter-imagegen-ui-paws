@@ -34,6 +34,10 @@ type EnvUser struct {
 	Password string `yaml:"password"`
 }
 
+type EnvGoogle struct {
+	ClientID string `yaml:"client-id"`
+}
+
 type EnvAuthentication struct {
 	lookup map[string]*EnvUser
 
@@ -50,6 +54,7 @@ type Environment struct {
 	Server         EnvServer         `yaml:"server"`
 	Settings       EnvSettings       `yaml:"settings"`
 	Authentication EnvAuthentication `yaml:"authentication"`
+	Google         EnvGoogle         `yaml:"google"`
 }
 
 func LoadEnv() (*Environment, error) {
@@ -176,6 +181,7 @@ func (e *Environment) Store() error {
 			"$.server":         {yaml.HeadComment("")},
 			"$.settings":       {yaml.HeadComment("")},
 			"$.authentication": {yaml.HeadComment("")},
+			"$.google":         {yaml.HeadComment("")},
 
 			"$.tokens.secret":     {yaml.HeadComment(" server secret for signing auth tokens; auto-generated if empty")},
 			"$.tokens.openrouter": {yaml.HeadComment(" openrouter.ai api token (required)")},
@@ -187,6 +193,8 @@ func (e *Environment) Store() error {
 
 			"$.authentication.enabled": {yaml.HeadComment(" require login with username and password")},
 			"$.authentication.users":   {yaml.HeadComment(" list of users with bcrypt password hashes")},
+
+			"$.google.client-id": {yaml.HeadComment(" oauth 2.0 client id for \"Google Drive\" integration (optional; leave empty to disable); create one at https://console.cloud.google.com/apis/credentials as a \"Web application\" client and add this server's origin to \"Authorized JavaScript origins\"")},
 		}
 	)
 

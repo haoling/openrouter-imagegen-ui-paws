@@ -48,10 +48,11 @@ func main() {
 		defer modelMx.RUnlock()
 
 		RespondJson(w, http.StatusOK, map[string]any{
-			"authenticated": IsAuthenticated(r),
-			"auth":          env.Authentication.Enabled,
-			"models":        ModelList,
-			"version":       Version,
+			"authenticated":  IsAuthenticated(r),
+			"auth":           env.Authentication.Enabled,
+			"models":         ModelList,
+			"version":        Version,
+			"googleClientId": env.Google.ClientID,
 		})
 	})
 

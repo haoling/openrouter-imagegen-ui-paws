@@ -13,6 +13,7 @@ import retrySvg from "../css/icons/retry.svg?raw";
 
 import { dropdown } from "./dropdown.js";
 import { connectDB, load, store } from "./storage.js";
+import { initGoogleDrive, isGoogleDriveAvailable, isGoogleDriveConnected, connectGoogleDrive, disconnectGoogleDrive, listFolders } from "./google-drive.js";
 
 const ChunkType = {
 	0: "start",
@@ -74,6 +75,14 @@ const $loader = document.getElementById("global-loader"),
 	$comparisonReferenceSelect = document.getElementById("comparison-reference-select"),
 	$closeComparisonModal = document.getElementById("close-comparison-modal"),
 	$usageDisplay = document.getElementById("usage-display"),
+	$googleDriveBtn = document.getElementById("google-drive-btn"),
+	$googleDriveModal = document.getElementById("google-drive-modal"),
+	$googleDriveError = document.getElementById("google-drive-error"),
+	$googleDriveStatus = document.getElementById("google-drive-status"),
+	$googleDriveFolderGroup = document.getElementById("google-drive-folder-group"),
+	$googleDriveFolder = document.getElementById("google-drive-folder"),
+	$googleDriveConnectBtn = document.getElementById("google-drive-connect-btn"),
+	$googleDriveDisconnectBtn = document.getElementById("google-drive-disconnect-btn"),
 	$maxRefResolution = document.getElementById("max-ref-resolution"),
 	$presetSelect = document.getElementById("preset-select"),
 	$savePresetBtn = document.getElementById("save-preset-btn"),
@@ -100,7 +109,8 @@ let rawRefs = load("referenceImages", []),
 	presetOrder = load("presetOrder", []),
 	activeComposerPane = load("activeComposerPane", "prompt"),
 	activePresetName = "",
-	unsavedPreset = null;
+	unsavedPreset = null,
+	driveFolderId = load("driveFolderId", "");
 
 $useDefaultSystem.checked = useDefaultSys;
 
@@ -1307,6 +1317,12 @@ async function loadData() {
 			return;
 		}
 
+		await initGoogleDrive(data.googleClientId, updateDriveStatus);
+
+		$googleDriveBtn.classList.toggle("hidden", !isGoogleDriveAvailable());
+
+		updateDriveStatus(isGoogleDriveConnected());
+
 		$model.innerHTML = "";
 
 		const existingDropdown = $model.nextElementSibling;
@@ -1392,6 +1408,44 @@ async function loadData() {
 	}
 }
 
+function updateDriveStatus(connected) {
+	$googleDriveStatus.textContent = connected ? "Connected" : "Not connected";
+	$googleDriveStatus.classList.toggle("connected", connected);
+
+	$googleDriveFolderGroup.classList.toggle("hidden", !connected);
+	$googleDriveConnectBtn.classList.toggle("hidden", connected);
+	$googleDriveDisconnectBtn.classList.toggle("hidden", !connected);
+
+	if (connected) {
+		loadDriveFolders();
+	}
+}
+
+async function loadDriveFolders() {
+	try {
+		const folders = await listFolders();
+
+		$googleDriveFolder.innerHTML = '<option value="">Select a folder...</option>';
+
+		for (const folder of folders) {
+			const option = document.createElement("option");
+
+			option.value = folder.id;
+			option.textContent = folder.name;
+
+			$googleDriveFolder.appendChild(option);
+		}
+
+		if (driveFolderId && folders.some(folder => folder.id === driveFolderId)) {
+			$googleDriveFolder.value = driveFolderId;
+		}
+	} catch (err) {
+		console.error("Failed to load Google Drive folders:", err);
+
+		$googleDriveError.textContent = `Error: ${err.message}`;
+	}
+}
+
 async function login() {
 	const username = $username.value.trim(),
 		password = $password.value.trim();
@@ -1465,6 +1519,44 @@ $username.addEventListener("input", () => {
 
 $password.addEventListener("input", () => {
 	$authentication.classList.remove("errored");
+});
+
+$googleDriveBtn.addEventListener("click", () => {
+	$googleDriveError.textContent = "";
+
+	updateDriveStatus(isGoogleDriveConnected());
+
+	$googleDriveModal.classList.add("open");
+});
+
+$googleDriveModal.querySelector(".background").addEventListener("click", () => {
+	$googleDriveModal.classList.remove("open");
+});
+
+$googleDriveConnectBtn.addEventListener("click", () => {
+	$googleDriveError.textContent = "";
+
+	try {
+		connectGoogleDrive();
+	} catch (err) {
+		console.error(err);
+
+		$googleDriveError.textContent = `Error: ${err.message}`;
+	}
+});
+
+$googleDriveDisconnectBtn.addEventListener("click", () => {
+	disconnectGoogleDrive();
+
+	driveFolderId = "";
+
+	store("driveFolderId", driveFolderId);
+});
+
+$googleDriveFolder.addEventListener("change", () => {
+	driveFolderId = $googleDriveFolder.value;
+
+	store("driveFolderId", driveFolderId);
 });
 
 $addRefBtn.addEventListener("click", () => {
@@ -1996,6 +2088,10 @@ document.addEventListener("keydown", event => {
 
 		if ($comparisonModal?.classList.contains("open")) {
 			$comparisonModal.classList.remove("open");
+		}
+
+		if ($googleDriveModal?.classList.contains("open")) {
+			$googleDriveModal.classList.remove("open");
 		}
 	}
 });
