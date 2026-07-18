@@ -6,6 +6,12 @@ let clientId = null,
 	tokenExpiresAt = 0,
 	onChange = () => {};
 
+function computeExpiry(expiresIn) {
+	const seconds = Number(expiresIn);
+
+	return Date.now() + Math.max((Number.isFinite(seconds) ? seconds : 0) - 60, 0) * 1000;
+}
+
 function loadGis() {
 	return new Promise((resolve, reject) => {
 		if (window.google?.accounts?.oauth2) {
@@ -38,24 +44,31 @@ export async function initGoogleDrive(id, changeCallback) {
 		return;
 	}
 
-	await loadGis();
+	try {
+		await loadGis();
 
-	tokenClient = google.accounts.oauth2.initTokenClient({
-		client_id: clientId,
-		scope: Scopes,
-		callback: response => {
-			if (response.error) {
-				console.error("Google Drive auth error:", response);
+		tokenClient = google.accounts.oauth2.initTokenClient({
+			client_id: clientId,
+			scope: Scopes,
+			callback: response => {
+				if (response.error) {
+					console.error("Google Drive auth error:", response);
 
-				return;
-			}
+					return;
+				}
 
-			accessToken = response.access_token;
-			tokenExpiresAt = Date.now() + (response.expires_in - 60) * 1000;
+				accessToken = response.access_token;
+				tokenExpiresAt = computeExpiry(response.expires_in);
 
-			onChange(true);
-		},
-	});
+				onChange(true);
+			},
+		});
+	} catch (err) {
+		clientId = null;
+		tokenClient = null;
+
+		throw err;
+	}
 }
 
 export function isGoogleDriveAvailable() {
@@ -71,7 +84,7 @@ export function connectGoogleDrive() {
 		throw new Error("Google Drive is not configured");
 	}
 
-	tokenClient.requestAccessToken({ prompt: "consent" });
+	return requestToken("consent");
 }
 
 export function disconnectGoogleDrive() {
@@ -99,7 +112,7 @@ function requestToken(prompt) {
 			}
 
 			accessToken = response.access_token;
-			tokenExpiresAt = Date.now() + (response.expires_in - 60) * 1000;
+			tokenExpiresAt = computeExpiry(response.expires_in);
 
 			onChange(true);
 

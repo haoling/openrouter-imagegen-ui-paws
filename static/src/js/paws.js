@@ -1317,7 +1317,11 @@ async function loadData() {
 			return;
 		}
 
-		await initGoogleDrive(data.googleClientId, updateDriveStatus);
+		try {
+			await initGoogleDrive(data.googleClientId, updateDriveStatus);
+		} catch (err) {
+			console.error("Failed to initialize Google Drive:", err);
+		}
 
 		$googleDriveBtn.classList.toggle("hidden", !isGoogleDriveAvailable());
 
@@ -1533,11 +1537,11 @@ $googleDriveModal.querySelector(".background").addEventListener("click", () => {
 	$googleDriveModal.classList.remove("open");
 });
 
-$googleDriveConnectBtn.addEventListener("click", () => {
+$googleDriveConnectBtn.addEventListener("click", async () => {
 	$googleDriveError.textContent = "";
 
 	try {
-		connectGoogleDrive();
+		await connectGoogleDrive();
 	} catch (err) {
 		console.error(err);
 
