@@ -5,10 +5,16 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net/http"
 	"sync"
 
 	"github.com/vmihailenco/msgpack/v5"
+)
+
+const (
+	MaxFrameLength      = 64 * 1024 * 1024
+	MaxPooledBufferSize = 1024 * 1024
 )
 
 const (
@@ -39,6 +45,67 @@ var pool = sync.Pool{
 	},
 }
 
+func (s *Stream) WriteChunk(chunk *Chunk) error {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	debugIf(chunk.Type == ChunkError, "error: %v", chunk.Data)
+
+	err := s.ctx.Err()
+	if err != nil {
+		return err
+	}
+
+	buf := GetFreeBuffer()
+	defer releaseBuffer(buf)
+
+	if image, ok := chunk.Data.(*ImageFrame); ok {
+		buf.Grow(len(image.Bytes) + len(image.MIME) + 32)
+	}
+
+	var header [5]byte
+
+	header[0] = byte(chunk.Type)
+	buf.Write(header[:])
+
+	if chunk.Data != nil {
+		err = msgpack.NewEncoder(buf).Encode(chunk.Data)
+		if err != nil {
+			return err
+		}
+	}
+
+	length := buf.Len() - len(header)
+	if length > MaxFrameLength {
+		return errors.New("image frame exceeds size limit")
+	}
+
+	binary.LittleEndian.PutUint32(buf.Bytes()[1:5], uint32(length))
+
+	written, err := s.wr.Write(buf.Bytes())
+	if err != nil {
+		return err
+	}
+
+	if written != buf.Len() {
+		return io.ErrShortWrite
+	}
+
+	flusher, ok := s.wr.(http.Flusher)
+	if !ok {
+		return errors.New("failed to create flusher")
+	}
+
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	default:
+		flusher.Flush()
+
+		return nil
+	}
+}
+
 func GetFreeBuffer() *bytes.Buffer {
 	buf := pool.Get().(*bytes.Buffer)
 
@@ -48,9 +115,9 @@ func GetFreeBuffer() *bytes.Buffer {
 }
 
 func NewStream(w http.ResponseWriter, ctx context.Context) (*Stream, error) {
-	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Content-Type", "application/x-paws-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	return &Stream{
 		wr:  w,
@@ -73,51 +140,9 @@ func GetErrorMessage(err error) string {
 	return err.Error()
 }
 
-func (s *Stream) WriteChunk(chunk *Chunk) error {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	debugIf(chunk.Type == ChunkError, "error: %v", chunk.Data)
-
-	err := s.ctx.Err()
-	if err != nil {
-		return err
-	}
-
-	buf := GetFreeBuffer()
-	defer pool.Put(buf)
-
-	binary.Write(buf, binary.LittleEndian, chunk.Type)
-
-	if chunk.Data != nil {
-		data, err := msgpack.Marshal(chunk.Data)
-		if err != nil {
-			return err
-		}
-
-		binary.Write(buf, binary.LittleEndian, uint32(len(data)))
-
-		buf.Write(data)
-	} else {
-		binary.Write(buf, binary.LittleEndian, uint32(0))
-	}
-
-	_, err = s.wr.Write(buf.Bytes())
-	if err != nil {
-		return err
-	}
-
-	flusher, ok := s.wr.(http.Flusher)
-	if !ok {
-		return errors.New("failed to create flusher")
-	}
-
-	select {
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-	default:
-		flusher.Flush()
-
-		return nil
+func releaseBuffer(buf *bytes.Buffer) {
+	// Do not keep multi-megabyte image frames alive between requests.
+	if buf.Cap() <= MaxPooledBufferSize {
+		pool.Put(buf)
 	}
 }

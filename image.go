@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -28,6 +27,11 @@ type ChatRequest struct {
 	Model  string      `json:"model"`
 	Image  ImageConfig `json:"image"`
 	Images []string    `json:"images"`
+}
+
+type ImageFrame struct {
+	MIME  string `msgpack:"mime"`
+	Bytes []byte `msgpack:"bytes"`
 }
 
 func (r *ChatRequest) Parse() (*openingrouter.ImageGenerationRequest, error) {
@@ -182,6 +186,7 @@ func HandleImage(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 
 		for {
 			select {
@@ -235,82 +240,62 @@ func RunCompletion(ctx context.Context, response *Stream, request *openingrouter
 		}
 
 		if chunk.B64JSON != "" {
-			imageURL := chunk.B64JSON
-			if !strings.HasPrefix(imageURL, "data:") {
-				mimeType := mimeTypeFromBase64(chunk.B64JSON)
-
-				imageURL = "data:" + mimeType + ";base64," + chunk.B64JSON
+			image, err := decodeImageFrame(chunk.B64JSON)
+			if err != nil {
+				return err
 			}
 
-			response.WriteChunk(NewChunk(ChunkImage, imageURL))
+			err = response.WriteChunk(NewChunk(ChunkImage, image))
+			if err != nil {
+				return err
+			}
 
 			hasContent = true
 		}
 	}
 
 	if !hasContent {
-		response.WriteChunk(NewChunk(ChunkError, errors.New("no content returned")))
+		return errors.New("no content returned")
 	}
 
 	if cost != -1 {
-		response.WriteChunk(NewChunk(ChunkUsage, cost))
-	}
-
-	response.WriteChunk(NewChunk(ChunkEnd, nil))
-
-	return nil
-}
-
-func mimeTypeFromBase64(b64 string) string {
-	if len(b64) < 4 {
-		return "image/png"
-	}
-
-	limit := 32
-	if len(b64) < limit {
-		limit = (len(b64) / 4) * 4
-	}
-
-	if limit == 0 {
-		return "image/png"
-	}
-
-	prefix := b64[:limit]
-
-	dec := make([]byte, base64.RawStdEncoding.DecodedLen(len(prefix)))
-
-	n, err := base64.RawStdEncoding.Decode(dec, []byte(prefix))
-	if err != nil {
-		dec = make([]byte, base64.StdEncoding.DecodedLen(len(prefix)))
-
-		n, err = base64.StdEncoding.Decode(dec, []byte(prefix))
+		err = response.WriteChunk(NewChunk(ChunkUsage, cost))
 		if err != nil {
-			return "image/png"
+			return err
 		}
 	}
 
-	dec = dec[:n]
+	return response.WriteChunk(NewChunk(ChunkEnd, nil))
+}
 
-	// PNG: 89 50 4E 47 0D 0A 1A 0A
-	if bytes.HasPrefix(dec, []byte("\x89PNG\r\n\x1a\n")) {
-		return "image/png"
+func decodeImageFrame(encoded string) (*ImageFrame, error) {
+	mimeType := ""
+
+	if strings.HasPrefix(encoded, "data:") {
+		header, payload, found := strings.Cut(encoded, ",")
+		if !found || !strings.HasSuffix(header, ";base64") {
+			return nil, errors.New("invalid image data URL")
+		}
+
+		mimeType = strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64")
+		encoded = payload
 	}
 
-	// JPEG: FF D8 FF
-	if bytes.HasPrefix(dec, []byte("\xff\xd8\xff")) {
-		return "image/jpeg"
+	if base64.StdEncoding.DecodedLen(len(encoded)) > MaxFrameLength-1024 {
+		return nil, errors.New("image exceeds frame size limit")
 	}
 
-	// WebP: RIFFxxxxWEBP
-	if len(dec) >= 12 && bytes.HasPrefix(dec, []byte("RIFF")) && bytes.Equal(dec[8:12], []byte("WEBP")) {
-		return "image/webp"
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decode image: %w", err)
 	}
 
-	// SVG: check for common tags
-	str := strings.TrimSpace(string(dec))
-	if strings.HasPrefix(str, "<svg") || strings.HasPrefix(str, "<?xml") || strings.Contains(strings.ToLower(str), "<svg") {
-		return "image/svg+xml"
+	if mimeType == "" {
+		mimeType = http.DetectContentType(decoded)
 	}
 
-	return "image/png"
+	return &ImageFrame{
+		MIME:  mimeType,
+		Bytes: decoded,
+	}, nil
 }

@@ -1,173 +1,539 @@
 import Dexie from "dexie";
 
+import { processBlob } from "./image-processing.js";
+
 const DatabaseName = "paws",
-	TableName = "kv";
+	AssetSchemaVersion = 2,
+	MaxThumbnails = 256,
+	MaxThumbnailBytes = 64 * 1024 * 1024,
+	MaxDerivatives = 128,
+	MaxDerivativeBytes = 64 * 1024 * 1024,
+	CollectionDelay = 5000,
+	AssetGracePeriod = 60000;
 
-function isNull(value) {
-	return value === "" || value === null || value === undefined;
-}
+const settings = new Map(),
+	jobSnapshots = new Map(),
+	assetHolds = new Map(),
+	pendingDerivatives = new Map();
 
-class StorageDB {
-	#database;
-	#scheduled = new Map();
-	#writes = new Map();
-	#cache = new Map();
-	#lastWrite = new Map();
-
-	async init() {
-		this.#database = new Dexie(DatabaseName);
-		this.#database.version(1).stores({
-			[TableName]: "&key",
-		});
-
-		await this.#database.open();
-
-		await this.#load();
-	}
-
-	async #load() {
-		const rows = await this.#database.table(TableName).toArray();
-
-		let total = 0;
-
-		rows.forEach(row => {
-			if (!isNull(row.value)) {
-				this.#cache.set(row.key, row.value);
-				total++;
-			}
-		});
-
-		console.info(`Loaded ${total} items from Dexie`);
-	}
-
-	async #write(key, retry) {
-		if (this.#writes.has(key)) {
-			if (retry) {
-				await this.#schedule(key);
-			}
-
-			return;
-		}
-
-		this.#writes.set(key, true);
-
-		try {
-			const value = this.#cache.get(key);
-
-			if (isNull(value)) {
-				await this.#database.table(TableName).delete(key);
-			} else {
-				await this.#database.table(TableName).put({
-					key: key,
-					value: value,
-					updatedAt: Date.now(),
-				});
-			}
-		} catch (error) {
-			console.error(`Failed to write to Dexie: ${error}`);
-		} finally {
-			this.#writes.delete(key);
-		}
-	}
-
-	#wait(ms) {
-		return new Promise(resolve => setTimeout(resolve, ms));
-	}
-
-	async #schedule(key) {
-		if (this.#scheduled.has(key)) {
-			return;
-		}
-
-		this.#scheduled.set(key, true);
-
-		await this.#wait(500);
-
-		this.#scheduled.delete(key);
-
-		await this.#write(key, true);
-	}
-
-	async store(key, value = false) {
-		if (isNull(value)) {
-			this.#cache.delete(key);
-		} else {
-			this.#cache.set(key, value);
-		}
-
-		this.#lastWrite.set(key, Date.now());
-
-		await this.#schedule(key);
-	}
-
-	async refresh(keys = []) {
-		if (!keys.length) {
-			return new Map();
-		}
-
-		const table = this.#database.table(TableName),
-			results = new Map();
-
-		for (const key of keys) {
-			const row = await table.get(key);
-
-			if (row && !isNull(row.value)) {
-				this.#cache.set(key, row.value);
-
-				results.set(key, row.value);
-			} else {
-				this.#cache.delete(key);
-
-				results.set(key, null);
-			}
-		}
-
-		return results;
-	}
-
-	load(key, fallback = false) {
-		if (!this.#cache.has(key)) {
-			return fallback;
-		}
-
-		return this.#cache.get(key);
-	}
-}
-
-let db;
+let database,
+	pendingWrites = Promise.resolve(),
+	migrating = true,
+	jobOrder = "",
+	collectionTimer;
 
 export async function connectDB() {
-	if (db) {
+	if (database) {
 		return;
 	}
 
-	const newDB = new StorageDB();
+	database = new Dexie(DatabaseName);
 
-	await newDB.init();
+	database.version(1).stores({
+		kv: "&key",
+	});
 
-	db = newDB;
+	database.version(AssetSchemaVersion).stores({
+		kv: "&key",
+		jobs: "&id",
+		assets: "&id",
+		assetInfo: "&id,derivativeKey",
+		thumbnails: "&key,source,lastUsed",
+		settings: "&key",
+	});
+
+	await database.open();
+	await migrate();
+
+	migrating = false;
+
+	scheduleCollection();
+
+	for (const row of await database.settings.toArray()) {
+		settings.set(row.key, row.value);
+	}
 }
 
-export function store(key, value = false) {
-	if (!db) {
+async function migrate() {
+	const schema = await database.settings.get("assetSchema");
+	if (schema?.value === AssetSchemaVersion) {
 		return;
 	}
 
-	db.store(key, value);
+	const legacy = await database.kv.toArray(),
+		values = new Map(legacy.map(row => [row.key, row.value])),
+		converted = [],
+		references = [],
+		imported = new Map();
+
+	const convert = source => {
+		if (!imported.has(source)) {
+			imported.set(source, importAsset(source));
+		}
+
+		return imported.get(source);
+	};
+
+	// Never modify the v1 rows during conversion. Failed/interrupted migrations can restart.
+	for (const entry of values.get("jobs") || []) {
+		const job = { ...entry, payload: { ...entry.payload } };
+
+		for (const field of ["result", "originalResult"]) {
+			if (job[field]) {
+				job[field] = await convert(job[field]);
+			}
+		}
+
+		job.payload.images = await Promise.all((job.payload.images || []).map(convert));
+
+		// Legacy payloads already contain model-ready pixels; retry them without a new limit.
+		job.referenceResolution = 0;
+
+		converted.push(job);
+	}
+
+	for (const entry of values.get("referenceImages") || []) {
+		const reference = typeof entry === "string" ? { original: entry, processed: entry } : { ...entry };
+
+		reference.original = await convert(reference.original || reference.processed);
+
+		// Rebuild intentional edits at original resolution; the old processed image may be downsized.
+		if (reference.crop || reference.brightness || reference.contrast) {
+			reference.processed = await deriveAsset(reference.original, {
+				crop: reference.crop,
+				brightness: reference.brightness || 0,
+				contrast: reference.contrast || 0,
+				format: "image/png",
+			});
+		} else {
+			reference.processed = reference.original;
+		}
+
+		references.push(reference);
+	}
+
+	await database.transaction("rw", database.jobs, database.settings, database.kv, async () => {
+		await database.jobs.bulkPut(converted);
+
+		for (const row of legacy) {
+			if (row.key !== "jobs" && row.key !== "referenceImages") {
+				await database.settings.put({ key: row.key, value: row.value });
+			}
+		}
+
+		await database.settings.bulkPut([
+			{ key: "jobOrder", value: converted.map(job => job.id) },
+			{ key: "referenceImages", value: references },
+			{ key: "assetSchema", value: AssetSchemaVersion },
+		]);
+
+		await database.kv.clear();
+	});
+}
+
+export async function loadJobs() {
+	const records = await database.jobs.toArray(),
+		byId = new Map(records.map(job => [job.id, job])),
+		order = load("jobOrder", []),
+		result = [];
+
+	for (const id of order) {
+		if (byId.has(id)) {
+			result.push(byId.get(id));
+			byId.delete(id);
+		}
+	}
+
+	result.push(...byId.values());
+
+	for (const job of result) {
+		jobSnapshots.set(job.id, JSON.stringify(job));
+	}
+
+	jobOrder = JSON.stringify(result.map(job => job.id));
+
+	return result;
+}
+
+function enqueue(operation) {
+	const write = pendingWrites.then(operation);
+
+	pendingWrites = write.catch(error => {
+		console.error("History could not be saved", error);
+		window.dispatchEvent(new CustomEvent("paws-storage-error", { detail: error }));
+	});
+
+	return write;
+}
+
+export function persistJobs(jobs) {
+	const snapshot = jobs.map(job => JSON.stringify(job)),
+		order = jobs.map(job => job.id),
+		serializedOrder = JSON.stringify(order);
+
+	return enqueue(async () => {
+		const ids = new Set(order),
+			changed = [];
+
+		for (let index = 0; index < order.length; index++) {
+			if (jobSnapshots.get(order[index]) !== snapshot[index]) {
+				changed.push(JSON.parse(snapshot[index]));
+			}
+		}
+
+		const removed = [...jobSnapshots.keys()].filter(id => !ids.has(id));
+
+		await database.transaction("rw", database.jobs, database.settings, async () => {
+			await database.jobs.bulkPut(changed);
+			await database.jobs.bulkDelete(removed);
+
+			if (jobOrder !== serializedOrder) {
+				await database.settings.put({ key: "jobOrder", value: order });
+			}
+		});
+
+		for (const job of changed) {
+			jobSnapshots.set(job.id, JSON.stringify(job));
+		}
+
+		for (const id of removed) {
+			jobSnapshots.delete(id);
+		}
+
+		jobOrder = serializedOrder;
+		settings.set("jobOrder", order);
+
+		scheduleCollection();
+	});
 }
 
 export function load(key, fallback = false) {
-	if (!db) {
-		return fallback;
-	}
+	return settings.has(key) ? settings.get(key) : fallback;
+}
 
-	return db.load(key, fallback);
+export function store(key, value = false) {
+	const snapshot = structuredClone(value);
+
+	settings.set(key, snapshot);
+
+	return enqueue(async () => {
+		await database.settings.put({ key: key, value: snapshot });
+
+		if (key === "referenceImages") {
+			scheduleCollection();
+		}
+	});
 }
 
 export async function refresh(keys = []) {
-	if (!db) {
-		return new Map();
+	const result = new Map();
+
+	await pendingWrites;
+
+	for (const key of keys) {
+		const row = await database.settings.get(key);
+
+		settings.set(key, row?.value);
+		result.set(key, row?.value ?? null);
 	}
 
-	return db.refresh(keys);
+	return result;
+}
+
+export function retainAsset(id) {
+	assetHolds.set(id, (assetHolds.get(id) || 0) + 1);
+
+	let released = false;
+
+	return () => {
+		if (released) {
+			return;
+		}
+
+		released = true;
+
+		const count = assetHolds.get(id) - 1;
+
+		if (count > 0) {
+			assetHolds.set(id, count);
+		} else {
+			assetHolds.delete(id);
+		}
+
+		scheduleCollection();
+	};
+}
+
+export async function importAsset(source, signal, dimensions) {
+	if (typeof source === "string" && source.startsWith("asset:")) {
+		return source;
+	}
+
+	const blob = source instanceof Blob ? source : await (await fetch(source, { signal: signal })).blob(),
+		hash = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer()),
+		id = `asset:${Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("")}`;
+
+	signal?.throwIfAborted();
+
+	if (await database.assetInfo.get(id)) {
+		return id;
+	}
+
+	const size = dimensions || await processBlob(blob, { inspect: true }, signal);
+
+	signal?.throwIfAborted();
+
+	await database.transaction("rw", database.assets, database.assetInfo, async () => {
+		await database.assets.put({
+			id: id,
+			blob: blob,
+		});
+
+		await database.assetInfo.put({
+			id: id,
+			width: size.width,
+			height: size.height,
+			type: blob.type,
+			bytes: blob.size,
+			createdAt: Date.now(),
+		});
+	});
+
+	scheduleCollection();
+
+	return id;
+}
+
+export async function assetBlob(id) {
+	const row = await database.assets.get(id);
+
+	if (!row) {
+		throw new Error(`Missing image asset: ${id}`);
+	}
+
+	return row.blob;
+}
+
+export function assetInfo(id) {
+	return database.assetInfo.get(id);
+}
+
+export async function deriveAsset(id, options = {}, signal) {
+	const release = retainAsset(id);
+
+	try {
+		signal?.throwIfAborted();
+
+		const info = await assetInfo(id);
+
+		signal?.throwIfAborted();
+
+		const noEdits = !options.crop && !options.brightness && !options.contrast,
+			fitsSize = !options.max || Math.max(info.width, info.height) <= options.max,
+			matchesFormat = !options.format || options.format === info.type;
+
+		if (noEdits && fitsSize && matchesFormat) {
+			return id;
+		}
+
+		const crop = options.crop,
+			format = options.format || info.type,
+			rectangle = crop ? [crop.x, crop.y, crop.width, crop.height] : null,
+			key = JSON.stringify([id, rectangle, options.brightness || 0, options.contrast || 0, options.max || 0, format]);
+
+		return await shareDerivative(key, async sharedSignal => {
+			const existing = await database.assetInfo.where("derivativeKey").equals(key).first();
+
+			if (existing) {
+				await database.assetInfo.update(existing.id, { lastUsed: Date.now() });
+
+				return existing.id;
+			}
+
+			const result = await processBlob(await assetBlob(id), { ...options, format: format }, sharedSignal);
+
+			sharedSignal.throwIfAborted();
+
+			const derived = await importAsset(result.blob, sharedSignal, result);
+
+			await database.assetInfo.update(derived, {
+				derivativeKey: key,
+				source: id,
+				lastUsed: Date.now(),
+			});
+
+			return derived;
+		}, signal);
+	} finally {
+		release();
+	}
+}
+
+function shareDerivative(key, produce, signal) {
+	signal?.throwIfAborted();
+
+	let operation = pendingDerivatives.get(key);
+
+	if (!operation) {
+		operation = {
+			controller: new AbortController(),
+			users: 0
+		};
+
+		pendingDerivatives.set(key, operation);
+
+		operation.promise = produce(operation.controller.signal).finally(() => {
+			if (pendingDerivatives.get(key) === operation) {
+				pendingDerivatives.delete(key);
+			}
+		});
+	}
+
+	operation.users++;
+
+	return new Promise((resolve, reject) => {
+		let done = false;
+
+		const finish = (callback, value) => {
+			if (done) {
+				return;
+			}
+
+			done = true;
+
+			signal?.removeEventListener("abort", abort);
+
+			operation.users--;
+
+			if (!operation.users && pendingDerivatives.get(key) === operation) {
+				pendingDerivatives.delete(key);
+
+				operation.controller.abort();
+			}
+
+			callback(value);
+		};
+
+		const abort = () => finish(reject, new DOMException("Aborted", "AbortError"));
+
+		signal?.addEventListener("abort", abort, { once: true });
+
+		operation.promise.then(value => finish(resolve, value), error => finish(reject, error));
+	});
+}
+
+export async function thumbnail(id, max, signal, fit = "contain") {
+	const key = `${id}:${max}:${fit}:webp`,
+		existing = await database.thumbnails.get(key);
+
+	if (existing) {
+		await database.thumbnails.update(key, { lastUsed: Date.now() });
+
+		return existing;
+	}
+
+	let crop;
+
+	if (fit === "cover") {
+		const info = await assetInfo(id),
+			edge = Math.min(info.width, info.height),
+			width = edge / info.width,
+			height = edge / info.height;
+
+		crop = { x: (1 - width) / 2, y: (1 - height) / 2, width: width, height: height };
+	}
+
+	const result = await processBlob(await assetBlob(id), { crop: crop, max: max, format: "image/webp" }, signal);
+
+	signal?.throwIfAborted();
+
+	const record = {
+		key: key,
+		source: id,
+		...result,
+		bytes: result.blob.size,
+		lastUsed: Date.now(),
+	};
+
+	await database.transaction("rw", database.thumbnails, async () => {
+		await database.thumbnails.put(record);
+
+		const records = await database.thumbnails.orderBy("lastUsed").reverse().toArray(),
+			removed = [];
+
+		let bytes = 0;
+
+		for (let index = 0; index < records.length; index++) {
+			bytes += records[index].bytes;
+
+			if (index >= MaxThumbnails || bytes > MaxThumbnailBytes) {
+				removed.push(records[index].key);
+			}
+		}
+
+		await database.thumbnails.bulkDelete(removed);
+	});
+
+	return record;
+}
+
+function scheduleCollection() {
+	if (migrating) {
+		return;
+	}
+
+	clearTimeout(collectionTimer);
+
+	collectionTimer = setTimeout(() => enqueue(collectAssets), CollectionDelay);
+}
+
+async function collectAssets() {
+	await database.transaction("rw", database.jobs, database.settings, database.assets, database.assetInfo, database.thumbnails, async () => {
+		const live = new Set(assetHolds.keys()),
+			references = (await database.settings.get("referenceImages"))?.value || [];
+
+		for (const reference of references) {
+			live.add(reference.original);
+			live.add(reference.processed);
+		}
+
+		for (const job of await database.jobs.toArray()) {
+			live.add(job.result);
+			live.add(job.originalResult);
+
+			for (const id of job.payload.images || []) {
+				live.add(id);
+			}
+		}
+
+		const dead = [],
+			records = await database.assetInfo.toArray(),
+			derivatives = records.filter(info => info.source && live.has(info.source) && !live.has(info.id)).sort((left, right) => right.lastUsed - left.lastUsed);
+
+		let derivativeBytes = 0;
+
+		for (let index = 0; index < derivatives.length; index++) {
+			derivativeBytes += derivatives[index].bytes;
+
+			if (index < MaxDerivatives && derivativeBytes <= MaxDerivativeBytes) {
+				live.add(derivatives[index].id);
+			}
+		}
+
+		for (const info of records) {
+			// A grace period protects newly imported assets until their owner is committed.
+			if (!live.has(info.id) && !assetHolds.has(info.id) && Date.now() - info.createdAt > AssetGracePeriod) {
+				dead.push(info.id);
+			}
+		}
+
+		await database.assets.bulkDelete(dead);
+		await database.assetInfo.bulkDelete(dead);
+		await database.thumbnails.where("source").anyOf(dead).delete();
+	});
+
+	// A one-shot sweep after the grace period also collects aborted imports in an idle page.
+	clearTimeout(collectionTimer);
+
+	collectionTimer = setTimeout(() => enqueue(collectAssets), AssetGracePeriod + CollectionDelay);
 }

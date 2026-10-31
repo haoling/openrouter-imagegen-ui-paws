@@ -1,8 +1,6 @@
 import "../css/paws.css";
 import "../css/dropdown.css";
 
-import { unpack } from "msgpackr";
-
 import deleteSvg from "../css/icons/delete.svg?raw";
 import downloadSvg from "../css/icons/download.svg?raw";
 import editSvg from "../css/icons/edit.svg?raw";
@@ -14,16 +12,11 @@ import pinSvg from "../css/icons/pin.svg?raw";
 import retrySvg from "../css/icons/retry.svg?raw";
 
 import { dropdown } from "./dropdown.js";
-import { connectDB, load, store } from "./storage.js";
-
-const ChunkType = {
-	0: "start",
-	1: "image",
-	2: "error",
-	3: "end",
-	4: "alive",
-	5: "usage",
-};
+import { Gallery } from "./gallery.js";
+import { bindImage, bindResponsiveImage, releaseImage, releaseImages, acquireImage, imageDataURL } from "./image-assets.js";
+import { stream } from "./image-stream.js";
+import { adjustImageTones } from "./image-transform.js";
+import { connectDB, load, store, loadJobs, persistJobs, importAsset, deriveAsset, assetInfo, retainAsset } from "./storage.js";
 
 const MaxImages = 4,
 	UsageTypes = ["daily", "weekly", "monthly", "total"],
@@ -103,11 +96,18 @@ const $loader = document.getElementById("global-loader"),
 	$composerTabs = document.querySelectorAll(".composer-tab"),
 	$systemDefaultToggle = document.getElementById("system-default-toggle");
 
-await connectDB();
+try {
+	await connectDB();
+} catch (error) {
+	$loader.textContent = `Could not load history: ${error.message}. History has not been cleared. Reload to retry.`;
 
-let rawRefs = load("referenceImages", []),
-	referenceImages = rawRefs.map(item => (typeof item === "string" ? { original: item, processed: item } : item)),
-	jobs = load("jobs", []),
+	throw error;
+}
+
+const executions = new Map();
+
+let referenceImages = load("referenceImages", []),
+	jobs = await loadJobs(),
 	modelsData = [],
 	currentUsageType = load("usageType", "daily"),
 	currentUsageData = null,
@@ -124,17 +124,17 @@ let rawRefs = load("referenceImages", []),
 	imageZoomPointerId = null,
 	cropItem = null,
 	cropJob = null,
-	cropJobImage = null,
+	cropSession = 0,
+	cropController = null,
 	cropSourceImage = null,
 	cropPreviewFrame = 0,
 	crop = null,
 	cropDrag = null,
 	draggedImageSource = null,
-	draggedJobCard = null;
-
-const jobImageUrls = new Map();
-
-let costEstimateSeq = 0;
+	draggedJobCard = null,
+	releaseDrag = null,
+	costEstimateSeq = 0,
+	gallery = null;
 
 $useDefaultSystem.checked = useDefaultSys;
 
@@ -209,8 +209,17 @@ function calculateAspectRatio(width, height) {
 function saveJobs() {
 	document.title = jobs.some(job => job.status === "pending") ? `paws *` : "paws";
 
-	store("jobs", jobs);
+	persistJobs(jobs).catch(reportStorageError);
+
+	gallery?.schedule();
 }
+
+function reportStorageError(error) {
+	$loader.textContent = `Could not save history: ${error.message}. Keep this page open and free browser storage before retrying.`;
+	$loader.classList.remove("hidden");
+}
+
+window.addEventListener("paws-storage-error", event => reportStorageError(event.detail));
 
 function clearJobDrag() {
 	draggedJobCard?.classList.remove("reordering");
@@ -243,11 +252,14 @@ $grid.addEventListener("dragover", event => {
 		columns = $grid.clientWidth > rect.width * 1.5,
 		before = columns ? event.clientX < rect.left + rect.width / 2 : event.clientY < rect.top + rect.height / 2;
 
-	if (before && target.previousElementSibling !== draggedJobCard) {
-		target.before(draggedJobCard);
-	} else if (!before && target.nextElementSibling !== draggedJobCard) {
-		target.after(draggedJobCard);
-	}
+	const sourceIndex = jobs.findIndex(job => job.id === draggedJobCard.dataset.jobId),
+		targetJob = jobs.find(job => job.id === target.dataset.jobId),
+		[moved] = jobs.splice(sourceIndex, 1),
+		targetIndex = jobs.indexOf(targetJob);
+
+	jobs.splice(targetIndex + (before ? 0 : 1), 0, moved);
+
+	gallery.render();
 });
 
 $grid.addEventListener("drop", event => {
@@ -266,10 +278,6 @@ function finishJobDrag() {
 		return;
 	}
 
-	const jobsById = new Map(jobs.map(job => [job.id, job]));
-
-	jobs = Array.from($grid.querySelectorAll(".job-card"), card => jobsById.get(card.dataset.jobId));
-
 	saveJobs();
 	clearJobDrag();
 }
@@ -284,76 +292,28 @@ document.addEventListener("click", event => {
 
 $grid.parentElement.addEventListener("scroll", closeJobMenus);
 
-function setJobImageSource(img, job) {
-	const result = job.result;
-
-	if (!result) {
-		return;
-	}
-
-	const existing = jobImageUrls.get(job.id);
-
-	if (existing?.source === result) {
-		img.src = existing.url;
-
-		return;
-	}
-
-	if (existing) {
-		URL.revokeObjectURL(existing.url);
-		jobImageUrls.delete(job.id);
-	}
-
-	fetch(result)
-		.then(response => response.blob())
-		.then(blob => {
-			if (job.result !== result) {
-				return;
-			}
-
-			const objectUrl = URL.createObjectURL(blob);
-
-			jobImageUrls.set(job.id, {
-				source: result,
-				url: objectUrl
-			});
-
-			img.src = objectUrl;
-		})
-		.catch(() => {
-			img.src = result;
-		});
-}
-
-function releaseJobImageUrl(job) {
-	const image = jobImageUrls.get(job.id);
-
-	if (image) {
-		URL.revokeObjectURL(image.url);
-		jobImageUrls.delete(job.id);
-	}
-}
-
-function addReferenceImage(source) {
+async function addReferenceImage(source) {
 	if (!source || referenceImages.length >= MaxImages) {
 		return;
 	}
 
-	return processRefImage(source).then(processed => {
+	const id = await importAsset(source);
+
+	if (referenceImages.length < MaxImages) {
 		referenceImages.push({
-			original: source,
-			processed: processed
+			original: id,
+			processed: id
 		});
 
 		renderReferenceImages();
-	});
+	}
 }
 
-function openImageModal(src) {
+function openImageModal(id) {
 	stopImageZoom();
 
-	$fullImage.src = src;
-	$zoomImage.src = src;
+	bindImage($fullImage, id);
+	bindImage($zoomImage, id);
 
 	$imageModal.classList.add("open");
 }
@@ -376,7 +336,11 @@ function stopImageZoom() {
 
 function closeImageModal() {
 	stopImageZoom();
+
 	$imageModal.classList.remove("open");
+
+	releaseImage($fullImage);
+	releaseImage($zoomImage);
 }
 
 function updateImageZoom(event) {
@@ -418,43 +382,6 @@ function updateCropAdjustments() {
 	$cropContrastValue.value = $cropContrast.value;
 }
 
-// Use the same tone curve for the preview and the saved pixels.
-function adjustImageTones(ctx, width, height, brightness, contrast) {
-	if (!brightness && !contrast) {
-		return;
-	}
-
-	const imageData = ctx.getImageData(0, 0, width, height),
-		pixels = imageData.data,
-		curve = new Uint8Array(256),
-		strength = 8 * Math.max(0, contrast) / 100,
-		endpoint = Math.tanh(strength / 2),
-		gamma = Math.pow(2, -brightness / 100);
-
-	for (let value = 0; value < 256; value++) {
-		const input = value / 255;
-
-		let tone = input;
-
-		if (contrast > 0) {
-			tone = (Math.tanh((input - 0.5) * strength) / endpoint + 1) / 2;
-		} else if (contrast < 0) {
-			// Lift blacks and lower whites instead of steepening the midtones.
-			tone = 0.5 + (input - 0.5) * (1 + contrast / 100);
-		}
-
-		curve[value] = Math.round(255 * Math.pow(clamp(tone, 0, 1), gamma));
-	}
-
-	for (let index = 0; index < pixels.length; index += 4) {
-		pixels[index] = curve[pixels[index]];
-		pixels[index + 1] = curve[pixels[index + 1]];
-		pixels[index + 2] = curve[pixels[index + 2]];
-	}
-
-	ctx.putImageData(imageData, 0, 0);
-}
-
 function renderCropPreview() {
 	if (!cropSourceImage?.complete || !cropSourceImage.naturalWidth) {
 		return;
@@ -463,37 +390,31 @@ function renderCropPreview() {
 	const brightness = Number($cropBrightness.value),
 		contrast = Number($cropContrast.value);
 
-	if (!brightness && !contrast) {
-		$cropImage.src = cropSourceImage.src;
-
-		return;
-	}
-
 	const scale = Math.min(1, 1000 / Math.max(cropSourceImage.naturalWidth, cropSourceImage.naturalHeight)),
-		canvas = document.createElement("canvas");
+		canvas = $cropImage;
 
 	canvas.width = Math.max(1, Math.round(cropSourceImage.naturalWidth * scale));
 	canvas.height = Math.max(1, Math.round(cropSourceImage.naturalHeight * scale));
 
-	const ctx = canvas.getContext("2d");
+	const context = canvas.getContext("2d");
 
-	ctx.drawImage(cropSourceImage, 0, 0, canvas.width, canvas.height);
+	context.drawImage(cropSourceImage, 0, 0, canvas.width, canvas.height);
 
-	adjustImageTones(ctx, canvas.width, canvas.height, brightness, contrast);
-
-	$cropImage.src = canvas.toDataURL("image/png");
+	adjustImageTones(context, canvas.width, canvas.height, brightness, contrast);
 }
 
-function openCropModal(item, jobImage = null) {
-	cropItem = jobImage ? null : item;
-	cropJob = jobImage ? item : null;
-	cropJobImage = jobImage;
+function openCropModal(item, isGeneration = false) {
+	closeCropModal();
+
+	cropController = new AbortController();
+	cropItem = isGeneration ? null : item;
+	cropJob = isGeneration ? item : null;
 
 	crop = item.crop ? { ...item.crop } : { x: 0, y: 0, width: 1, height: 1 };
 
 	$cropBrightness.value = item.brightness || 0;
 	$cropContrast.value = item.contrast || 0;
-	$cropTitle.textContent = jobImage ? "Edit Generation" : "Edit Reference";
+	$cropTitle.textContent = isGeneration ? "Edit Generation" : "Edit Reference";
 
 	updateCropAdjustments();
 
@@ -508,20 +429,30 @@ function openCropModal(item, jobImage = null) {
 		}
 	};
 
-	source.src = jobImage ? item.originalResult || item.result : item.original;
-
-	$cropImage.src = source.src;
+	bindImage(source, isGeneration ? item.originalResult || item.result : item.original, 1000);
 	$cropModal.classList.add("open");
 
 	requestAnimationFrame(renderCropSelection);
 }
 
 function closeCropModal() {
+	cropSession++;
+	cropController?.abort();
+	cropController = null;
+
+	if (cropSourceImage) {
+		releaseImage(cropSourceImage);
+	}
+
+	$cropImage.width = 1;
+	$cropImage.height = 1;
+	$applyCropBtn.disabled = false;
+
+	$cropModal.classList.remove("loading");
 	$cropModal.classList.remove("open");
 
 	cropItem = null;
 	cropJob = null;
-	cropJobImage = null;
 	cropSourceImage = null;
 
 	cancelAnimationFrame(cropPreviewFrame);
@@ -560,77 +491,15 @@ function openComparisonModal(job) {
 	dropdown($comparisonReferenceSelect);
 
 	$comparisonReferencePicker.classList.toggle("hidden", refs.length < 2);
-	$comparisonAfter.src = job.result;
-	$comparisonBefore.src = refs[0];
+
+	bindImage($comparisonAfter, job.result);
+	bindImage($comparisonBefore, refs[0]);
+
 	$comparisonRange.value = 50;
 
 	updateComparisonPosition();
 
 	$comparisonModal.classList.add("open");
-}
-
-function readFileAsDataUrl(file) {
-	return new Promise((resolve, reject) => {
-		const reader = new FileReader();
-
-		reader.onload = () => resolve(reader.result);
-		reader.onerror = reject;
-
-		reader.readAsDataURL(file);
-	});
-}
-
-function processImage(dataUrl, cropRect, brightness, contrast, maxRes, format) {
-	return new Promise((resolve, reject) => {
-		const img = new Image();
-
-		img.onload = () => {
-			try {
-				const sourceX = Math.round((cropRect?.x || 0) * img.naturalWidth),
-					sourceY = Math.round((cropRect?.y || 0) * img.naturalHeight),
-					sourceWidth = Math.max(1, Math.round((cropRect?.width || 1) * img.naturalWidth)),
-					sourceHeight = Math.max(1, Math.round((cropRect?.height || 1) * img.naturalHeight));
-
-					let width = sourceWidth,
-					height = sourceHeight;
-
-				if (maxRes > 0) {
-					const maxDim = Math.max(width, height);
-
-					if (maxDim > maxRes) {
-						const scale = maxRes / maxDim;
-
-						width = Math.round(width * scale);
-						height = Math.round(height * scale);
-					}
-				}
-
-				const canvas = document.createElement("canvas");
-
-				canvas.width = width;
-				canvas.height = height;
-
-				const ctx = canvas.getContext("2d");
-
-				ctx.drawImage(img, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, width, height);
-
-				adjustImageTones(ctx, width, height, brightness, contrast);
-
-				resolve(canvas.toDataURL(format, 0.92));
-			} catch (error) {
-				reject(error);
-			}
-		};
-
-		img.onerror = reject;
-		img.src = dataUrl;
-	});
-}
-
-function processRefImage(dataUrl, cropRect, brightness = 0, contrast = 0) {
-	const maxRes = parseInt($maxRefResolution.value, 10) || 0;
-
-	return processImage(dataUrl, cropRect, brightness, contrast, maxRes, "image/jpeg");
 }
 
 function updateUsageDisplay() {
@@ -778,21 +647,15 @@ function hideCostEstimate($costSpan) {
 	$costSpan.textContent = "";
 }
 
-function imageSize(src) {
-	return new Promise(resolve => {
-		if (!src) {
-			resolve({ width: 0, height: 0 });
+async function imageSize(id) {
+	const info = await assetInfo(id),
+		max = Number($maxRefResolution.value),
+		scale = max > 0 ? Math.min(1, max / Math.max(info.width, info.height)) : 1;
 
-			return;
-		}
-
-		const img = new Image();
-
-		img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
-		img.onerror = () => resolve({ width: 0, height: 0 });
-
-		img.src = src;
-	});
+	return {
+		width: Math.max(1, Math.round(info.width * scale)),
+		height: Math.max(1, Math.round(info.height * scale)),
+	};
 }
 
 function setComposerPane(pane, persist = true) {
@@ -822,6 +685,8 @@ function setComposerPane(pane, persist = true) {
 }
 
 function renderReferenceImages() {
+	releaseImages($refImagesContainer);
+
 	$refImagesContainer.querySelectorAll(".ref-img-wrapper").forEach(el => el.remove());
 
 	referenceImages.forEach((item, index) => {
@@ -831,7 +696,7 @@ function renderReferenceImages() {
 
 		const img = document.createElement("img");
 
-		img.src = item.processed || item.original;
+		bindResponsiveImage(img, item.processed || item.original);
 
 		wrapper.appendChild(img);
 
@@ -852,6 +717,10 @@ function renderReferenceImages() {
 		rmBtn.title = "Remove image";
 
 		rmBtn.addEventListener("click", () => {
+			if (cropItem === item) {
+				closeCropModal();
+			}
+
 			referenceImages.splice(index, 1);
 
 			renderReferenceImages();
@@ -863,7 +732,8 @@ function renderReferenceImages() {
 		wrapper.__refItem = item;
 
 		wrapper.addEventListener("dragstart", event => {
-			draggedImageSource = item.original;
+			startAssetDrag(event, item.processed || item.original);
+
 			event.dataTransfer.setData("application/paws-ref-sort", "true");
 			event.dataTransfer.setData("application/paws-reference-image", "reference");
 			event.dataTransfer.effectAllowed = "move";
@@ -945,10 +815,7 @@ async function handleFiles(files) {
 			continue;
 		}
 
-		const dataUrl = await readFileAsDataUrl(file),
-			processed = await processRefImage(dataUrl);
-
-		referenceImages.push({ original: dataUrl, processed: processed });
+		await addReferenceImage(file);
 	}
 
 	renderReferenceImages();
@@ -1069,7 +936,7 @@ function createJobDOM(job) {
 	if (job.status !== "done" && !job.result) {
 		img.classList.add("blurred", "hidden");
 	} else if (job.result) {
-		setJobImageSource(img, job);
+		bindResponsiveImage(img, job.result);
 
 		if (job.status === "done") {
 			img.draggable = true;
@@ -1242,13 +1109,14 @@ function createJobDOM(job) {
 		specs.appendChild(qualityBadge);
 	}
 
-	img.addEventListener("load", () => {
-		if (img.naturalWidth && img.naturalHeight) {
-			aspectBadge.textContent = calculateAspectRatio(img.naturalWidth, img.naturalHeight);
-
-			aspectBadge.classList.remove("hidden");
-		}
-	});
+	if (job.result) {
+		assetInfo(job.result).then(info => {
+			if (info && card.isConnected) {
+				aspectBadge.textContent = calculateAspectRatio(info.width, info.height);
+				aspectBadge.classList.remove("hidden");
+			}
+		});
+	}
 
 	imgContainer.appendChild(specs);
 
@@ -1265,11 +1133,13 @@ function createJobDOM(job) {
 		for (const src of refs) {
 			const refImg = document.createElement("img");
 
-			refImg.src = src;
+			bindImage(refImg, src, Math.ceil(24 * devicePixelRatio * 1.5 / 64) * 64, "cover");
+
 			refImg.draggable = true;
 
 			refImg.addEventListener("dragstart", event => {
-				draggedImageSource = src;
+				startAssetDrag(event, src);
+
 				event.dataTransfer.setData("application/paws-reference-image", "reference");
 				event.dataTransfer.effectAllowed = "copy";
 			});
@@ -1392,31 +1262,20 @@ function createJobDOM(job) {
 	};
 }
 
-function setupJobUI(ui, job, controller = null, clearTimer = null) {
-	let isDone = job.status !== "pending";
-
-	const cleanupActions = () => {
-		isDone = true;
-
-		ui.$spinner.classList.add("hidden");
-		ui.retryBtn.classList.remove("hidden");
-	};
-
+function setupJobUI(ui, job) {
 	ui.closeBtn.addEventListener("click", () => {
 		if (job.pinned && !confirm("Remove this pinned generation?")) {
 			return;
 		}
 
-		if (clearTimer) {
-			clearTimer();
+		executions.get(job.id)?.abort();
+		executions.delete(job.id);
+
+		if (cropJob === job) {
+			closeCropModal();
 		}
 
-		if (!isDone && controller) {
-			controller.abort();
-		}
-
-		ui.card.remove();
-		releaseJobImageUrl(job);
+		gallery.invalidate(job.id);
 
 		jobs = jobs.filter(jb => jb.id !== job.id);
 
@@ -1428,15 +1287,7 @@ function setupJobUI(ui, job, controller = null, clearTimer = null) {
 			return;
 		}
 
-		if (clearTimer) {
-			clearTimer();
-		}
-
-		if (!isDone && controller) {
-			controller.abort();
-		}
-
-		startGenerationJob(job, ui.card);
+		startGenerationJob(job);
 	});
 
 	ui.pinBtn.addEventListener("click", () => {
@@ -1477,22 +1328,29 @@ function setupJobUI(ui, job, controller = null, clearTimer = null) {
 		}
 	});
 
-	ui.dlBtn.addEventListener("click", () => {
-		if (!ui.$img.src) {
+	ui.dlBtn.addEventListener("click", async () => {
+		if (!job.result) {
 			return;
 		}
 
-		const a = document.createElement("a");
+		const lease = acquireImage(job.result);
 
-		a.href = job.result;
-		a.download = `p${(job.finishedAt || job.startedAt).toString(16)}.png`;
+		try {
+			const link = document.createElement("a"),
+				info = await assetInfo(job.result);
 
-		a.click();
+			link.href = await lease.url;
+			link.download = `p${(job.finishedAt || job.startedAt).toString(16)}.${info.type.split("/")[1] || "png"}`;
+
+			link.click();
+		} finally {
+			setTimeout(() => lease.release(), 1000);
+		}
 	});
 
 	ui.$img.addEventListener("click", () => {
-		if (isDone && ui.$img.src && typeof openImageModal === "function") {
-			openImageModal(ui.$img.src);
+		if (job.status !== "pending" && job.result) {
+			openImageModal(job.result);
 		}
 	});
 
@@ -1531,7 +1389,7 @@ function setupJobUI(ui, job, controller = null, clearTimer = null) {
 
 	ui.editImageItem.addEventListener("click", () => {
 		closeJobMenus();
-		openCropModal(job, ui.$img);
+		openCropModal(job, true);
 	});
 
 	ui.loadSettingsItem.addEventListener("click", () => {
@@ -1555,114 +1413,30 @@ function setupJobUI(ui, job, controller = null, clearTimer = null) {
 	});
 
 	ui.$img.addEventListener("dragstart", event => {
-		if (!isDone || !job.result) {
+		if (job.status === "pending" || !job.result) {
 			event.preventDefault();
 
 			return;
 		}
 
-		draggedImageSource = job.result;
+		startAssetDrag(event, job.result);
 
 		event.dataTransfer.setData("application/paws-result-image", job.id);
 		event.dataTransfer.effectAllowed = "copy";
 	});
-
-	return cleanupActions;
 }
 
-async function stream(url, options, callback) {
-	let aborted;
-
-	try {
-		const response = await fetch(url, options);
-
-		if (!response.ok) {
-			const err = await response.json().catch(() => null);
-
-			throw new Error(err?.error || response.statusText);
-		}
-
-		const reader = response.body.getReader();
-
-		let buffer = new Uint8Array();
-
-		while (true) {
-			const { value, done } = await reader.read();
-
-			if (done) {
-				break;
-			}
-
-			const read = new Uint8Array(buffer.length + value.length);
-
-			read.set(buffer);
-			read.set(value, buffer.length);
-
-			buffer = read;
-
-			while (buffer.length >= 5) {
-				const type = ChunkType[buffer[0]],
-					length = buffer[1] | (buffer[2] << 8) | (buffer[3] << 16) | (buffer[4] << 24);
-
-				if (!type) {
-					console.warn("bad chunk type", type);
-
-					buffer = buffer.slice(5 + length);
-
-					continue;
-				}
-
-				if (buffer.length < 5 + length) {
-					break;
-				}
-
-				let data;
-
-				if (length > 0) {
-					const packed = buffer.slice(5, 5 + length);
-
-					try {
-						data = unpack(packed);
-					} catch (err) {
-						console.warn("bad chunk data", packed, err);
-					}
-				}
-
-				buffer = buffer.slice(5 + length);
-
-				if (type === "alive") {
-					continue;
-				}
-
-				callback({
-					type: type,
-					data: data,
-				});
-			}
-		}
-	} catch (err) {
-		if (err.name === "AbortError") {
-			aborted = true;
-
-			return;
-		}
-
-		console.error(err);
-
-		callback({
-			type: "error",
-			data: err.message,
-		});
-	} finally {
-		callback(aborted ? "aborted" : "done");
-	}
-}
-
-async function startGenerationJob(retryJob = null, replaceCard = null) {
+async function startGenerationJob(retryJob = null) {
 	let job;
 
 	if (retryJob) {
-		releaseJobImageUrl(retryJob);
+		executions.get(retryJob.id)?.abort();
+
+		if (cropJob === retryJob) {
+			closeCropModal();
+		}
+
+		gallery.invalidate(retryJob.id);
 
 		job = retryJob;
 
@@ -1684,7 +1458,7 @@ async function startGenerationJob(retryJob = null, replaceCard = null) {
 			model: $model.value,
 			system: $systemMessage.value.trim(),
 			prompt: $prompt.value.trim(),
-			images: referenceImages.map(img => img.processed || img),
+			images: referenceImages.map(img => img.processed || img.original),
 			image: {
 				resolution: $resolution.value,
 				aspect: $aspectRatio.value,
@@ -1697,7 +1471,8 @@ async function startGenerationJob(retryJob = null, replaceCard = null) {
 		}
 
 		job = {
-			id: Date.now().toString() + Math.random().toString(36).substring(2),
+			id: crypto.randomUUID(),
+			referenceResolution: Number($maxRefResolution.value),
 			payload: payload,
 			status: "pending",
 			result: null,
@@ -1710,150 +1485,95 @@ async function startGenerationJob(retryJob = null, replaceCard = null) {
 
 	saveJobs();
 
-	const ui = createJobDOM(job);
-
-	if (replaceCard?.parentNode) {
-		replaceCard.replaceWith(ui.card);
-	} else {
-		$grid.prepend(ui.card);
-	}
-
 	const controller = new AbortController(),
-		startTime = job.startedAt;
+		signal = controller.signal,
+		isCurrent = () => executions.get(job.id) === controller && !signal.aborted,
+		releases = job.payload.images.map(retainAsset);
 
-	const timerInterval = setInterval(() => {
-		ui.$timer.textContent = formatDuration(Date.now() - startTime);
-		ui.$timer.classList.remove("hidden");
-	}, 1000);
+	executions.set(job.id, controller);
 
-	ui.$timer.textContent = formatDuration(0);
-	ui.$timer.classList.remove("hidden");
-
-	const clearTimer = () => {
-		clearInterval(timerInterval);
-	};
-
-	const cleanupActions = setupJobUI(ui, job, controller, clearTimer);
-
-	stream(
-		"/-/image",
-		{
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(job.payload),
-			signal: controller.signal,
-		},
-		chunk => {
-			if (chunk === "done" || chunk === "aborted") {
-				cleanupActions();
-
-				ui.$img.classList.remove("blurred");
-
-				clearTimer();
-
-				job.duration = Date.now() - startTime;
-
-				ui.$timer.textContent = formatDuration(job.duration);
-
-				if (chunk === "done" && !ui.$img.classList.contains("hidden")) {
-					ui.dlBtn.classList.remove("hidden");
-					ui.editImageItem.disabled = false;
-
-					job.status = "done";
-					job.finishedAt ||= Date.now();
-
-					saveJobs();
-
-					fetchUsage();
-				} else if (chunk === "aborted") {
-					job.status = "errored";
-					job.error = "Aborted";
-
-					ui.$error.textContent = job.error;
-					ui.$error.classList.remove("hidden");
-
-					ui.card.classList.add("errored");
-
-					saveJobs();
-				}
-
+	try {
+		await stream("/-/image", await prepareGenerationRequest(job, signal, releases), async chunk => {
+			if (!isCurrent()) {
 				return;
 			}
 
-			switch (chunk.type) {
-				case "image":
-					job.result = chunk.data;
+			if (chunk.type === "image") {
+				if (!(chunk.data?.bytes instanceof Uint8Array) || !/^image\/(png|jpeg|webp|gif|avif)$/.test(chunk.data.mime)) {
+					throw new Error("Invalid binary image frame");
+				}
 
-					setJobImageSource(ui.$img, job);
+				const id = await importAsset(new Blob([chunk.data.bytes], { type: chunk.data.mime }), signal);
 
-					ui.$img.classList.remove("hidden");
+				if (!isCurrent()) {
+					return;
+				}
 
-					if (ui.useRefItem) {
-						ui.useRefItem.disabled = false;
-					}
-
-					if (ui.compareItem && (job.payload.images || []).length > 0) {
-						ui.compareItem.disabled = false;
-					}
-
-					ui.$img.draggable = true;
-
-					saveJobs();
-
-					break;
-				case "end":
-					cleanupActions();
-
-					clearTimer();
-
-					job.duration = Date.now() - startTime;
-
-					ui.$timer.textContent = formatDuration(job.duration);
-
-					ui.$img.classList.remove("blurred");
-					ui.dlBtn.classList.remove("hidden");
-					ui.editImageItem.disabled = false;
-
-					job.status = "done";
-					job.finishedAt ||= Date.now();
-
-					saveJobs();
-
-					fetchUsage();
-
-					break;
-				case "error":
-					cleanupActions();
-
-					clearTimer();
-
-					job.duration = Date.now() - startTime;
-
-					ui.$timer.textContent = formatDuration(job.duration);
-
-					ui.card.classList.add("errored");
-
-					ui.$error.textContent = chunk.data;
-					ui.$error.classList.remove("hidden");
-
-					job.status = "errored";
-					job.error = chunk.data;
-
-					saveJobs();
-
-					break;
-				case "usage":
-					job.cost = chunk.data;
-
-					ui.$cost.textContent = formatMoney(chunk.data);
-					ui.$cost.classList.remove("hidden");
-
-					saveJobs();
-
-					break;
+				job.result = id;
+			} else if (chunk.type === "error") {
+				throw new Error(chunk.data);
+			} else if (chunk.type === "usage") {
+				job.cost = chunk.data;
 			}
+
+			saveJobs();
+
+			gallery.invalidate(job.id);
+		});
+
+		if (isCurrent()) {
+			if (!job.result) {
+				throw new Error("No image returned");
+			}
+
+			job.status = "done";
+			job.finishedAt = Date.now();
+
+			fetchUsage();
 		}
-	);
+	} catch (error) {
+		if (isCurrent()) {
+			job.status = "errored";
+			job.error = error.message;
+		}
+	} finally {
+		for (const release of releases) {
+			release();
+		}
+
+		if (isCurrent()) {
+			job.duration = Date.now() - job.startedAt;
+			executions.delete(job.id);
+
+			saveJobs();
+
+			gallery.invalidate(job.id);
+		}
+	}
+}
+
+async function prepareGenerationRequest(job, signal, releases) {
+	// Base64 exists only while preparing/submitting the request, never throughout generation.
+	const images = [];
+
+	for (const id of job.payload.images) {
+		const prepared = await deriveAsset(id, { max: job.referenceResolution || 0 }, signal);
+
+		releases.push(retainAsset(prepared));
+		images.push(await imageDataURL(prepared, signal));
+	}
+
+	signal.throwIfAborted();
+
+	return {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			...job.payload,
+			images: images
+		}),
+		signal: signal,
+	};
 }
 
 async function fetchUsage() {
@@ -2078,7 +1798,16 @@ function isImageDrop(dataTransfer) {
 
 	const types = Array.from(dataTransfer.types);
 
-	return types.includes("Files") || types.includes("application/paws-result-image") || types.includes("application/paws-reference-image");
+	return types.includes("Files") || types.includes("application/paws-asset") || types.includes("application/paws-result-image") || types.includes("application/paws-reference-image");
+}
+
+function startAssetDrag(event, id) {
+	releaseDrag?.();
+
+	draggedImageSource = id;
+	releaseDrag = retainAsset(id);
+
+	event.dataTransfer.setData("application/paws-asset", id);
 }
 
 function setPageDragOver(active) {
@@ -2144,10 +1873,27 @@ document.addEventListener("drop", async event => {
 		return;
 	}
 
+	const internal = event.dataTransfer?.getData("application/paws-asset");
+
+	if (internal || draggedImageSource) {
+		event.preventDefault();
+
+		const id = internal || draggedImageSource,
+			release = retainAsset(id);
+
+		try {
+			await addReferenceImage(id);
+		} finally {
+			release();
+		}
+
+		return;
+	}
+
 	const data = event.dataTransfer?.getData("text/plain"),
 		files = event.dataTransfer?.files,
 		hasImageFiles = files && [...files].some(file => file.type.startsWith("image/")),
-		source = draggedImageSource || (data?.startsWith("data:image") ? data : null);
+		source = data?.startsWith("data:image") ? data : null;
 
 	if (!hasImageFiles && !source) {
 		return;
@@ -2165,6 +1911,9 @@ document.addEventListener("drop", async event => {
 });
 
 document.addEventListener("dragend", () => {
+	releaseDrag?.();
+	releaseDrag = null;
+
 	draggedImageSource = null;
 
 	clearPageDragOver();
@@ -2298,18 +2047,10 @@ $quality.addEventListener("change", () => {
 	updateResolutionEstimate();
 });
 
-$maxRefResolution.addEventListener("change", async () => {
+$maxRefResolution.addEventListener("change", () => {
 	store("maxRefResolution", $maxRefResolution.value);
 
-	if (referenceImages.length > 0) {
-		for (const referenceImage of referenceImages) {
-			referenceImage.processed = await processRefImage(
-				referenceImage.original, referenceImage.crop, referenceImage.brightness || 0, referenceImage.contrast || 0
-			);
-		}
-
-		renderReferenceImages();
-	}
+	updateResolutionEstimate();
 });
 
 $generateBtn.addEventListener("click", () => startGenerationJob());
@@ -2388,45 +2129,68 @@ $applyCropBtn.addEventListener("click", async () => {
 
 	const selection = crop.x === 0 && crop.y === 0 && crop.width === 1 && crop.height === 1 ? undefined : { ...crop },
 		brightness = Number($cropBrightness.value),
-		contrast = Number($cropContrast.value);
+		contrast = Number($cropContrast.value),
+		session = cropSession,
+		job = cropJob,
+		item = cropItem,
+		signal = cropController.signal,
+		original = job ? job.originalResult || job.result : item.original,
+		hasEdits = Boolean(selection || brightness || contrast),
+		edits = {
+			crop: selection,
+			brightness: brightness,
+			contrast: contrast,
+			format: "image/png",
+		};
+
+	$applyCropBtn.disabled = true;
 
 	try {
-		if (cropJob) {
-			const original = cropJob.originalResult || cropJob.result,
-				result = selection || brightness || contrast
-					? await processImage(original, selection, brightness, contrast, 0, "image/png")
-					: original;
+		const result = hasEdits ? await deriveAsset(original, edits, signal) : original;
 
-			cropJob.result = result;
-			cropJob.crop = selection;
-			cropJob.brightness = brightness;
-			cropJob.contrast = contrast;
-
-			if (result === original) {
-				delete cropJob.originalResult;
-			} else {
-				cropJob.originalResult = original;
+		if (job) {
+			if (session !== cropSession || !jobs.includes(job)) {
+				return;
 			}
 
-			setJobImageSource(cropJobImage, cropJob);
+			job.result = result;
+			job.crop = selection;
+			job.brightness = brightness;
+			job.contrast = contrast;
+
+			if (result === original) {
+				delete job.originalResult;
+			} else {
+				job.originalResult = original;
+			}
+
+			gallery.invalidate(job.id);
 			saveJobs();
 		} else {
-			const processed = await processRefImage(cropItem.original, selection, brightness, contrast);
+			if (session !== cropSession || !referenceImages.includes(item)) {
+				return;
+			}
 
-			cropItem.crop = selection;
-			cropItem.brightness = brightness;
-			cropItem.contrast = contrast;
-			cropItem.processed = processed;
+			item.crop = selection;
+			item.brightness = brightness;
+			item.contrast = contrast;
+			item.processed = result;
 
 			renderReferenceImages();
 		}
 
 		closeCropModal();
 	} catch (error) {
-		console.error("Failed to edit image", error);
-		alert("Could not apply the image edits.");
+		if (error.name !== "AbortError") {
+			console.error("Failed to edit image", error);
+
+			alert("Could not apply the image edits.");
+		}
 	} finally {
-		$cropModal.classList.remove("loading");
+		if (session === cropSession) {
+			$applyCropBtn.disabled = false;
+			$cropModal.classList.remove("loading");
+		}
 	}
 });
 
@@ -2529,16 +2293,18 @@ $cropStage.addEventListener("pointercancel", () => {
 $comparisonRange.addEventListener("input", updateComparisonPosition);
 
 $comparisonReferenceSelect.addEventListener("change", () => {
-	$comparisonBefore.src = $comparisonReferenceSelect.value;
+	bindImage($comparisonBefore, $comparisonReferenceSelect.value);
 });
 
-$comparisonModal.querySelector(".background").addEventListener("click", () => {
+function closeComparisonModal() {
 	$comparisonModal.classList.remove("open");
-});
 
-$closeComparisonModal.addEventListener("click", () => {
-	$comparisonModal.classList.remove("open");
-});
+	releaseImage($comparisonBefore);
+	releaseImage($comparisonAfter);
+}
+
+$comparisonModal.querySelector(".background").addEventListener("click", closeComparisonModal);
+$closeComparisonModal.addEventListener("click", closeComparisonModal);
 
 resDropdown = dropdown($resolution);
 aspectDropdown = dropdown($aspectRatio);
@@ -2551,20 +2317,21 @@ if (referenceImages.length > 0) {
 
 await loadData();
 
-for (let i = jobs.length - 1; i >= 0; i--) {
-	const job = jobs[i];
-
+for (const job of jobs) {
 	if (job.status === "pending") {
 		job.status = "errored";
 		job.error = "Aborted (page reload)";
 	}
 
+}
+
+gallery = new Gallery($grid, () => jobs, job => {
 	const ui = createJobDOM(job);
 
-	$grid.prepend(ui.card);
-
 	setupJobUI(ui, job);
-}
+
+	return ui;
+});
 
 saveJobs();
 
@@ -2877,7 +2644,7 @@ document.addEventListener("keydown", event => {
 		}
 
 		if ($comparisonModal?.classList.contains("open")) {
-			$comparisonModal.classList.remove("open");
+			closeComparisonModal();
 		}
 
 		if ($cropModal?.classList.contains("open")) {
@@ -2894,4 +2661,4 @@ setComposerPane(activeComposerPane, false);
 
 fetchUsage();
 
-$loader.remove();
+$loader.classList.add("hidden");
