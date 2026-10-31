@@ -16,6 +16,7 @@ type ModelOptions struct {
 	Qualities     []string `json:"qualities"`
 	Resolutions   []string `json:"resolutions"`
 	MaxReferences int      `json:"max_references"`
+	MinReferences int      `json:"min_references"`
 }
 
 type Model struct {
@@ -25,6 +26,10 @@ type Model struct {
 	Pricing *ImagePricing `json:"pricing,omitempty"`
 	Author  string        `json:"author,omitempty"`
 	Options ModelOptions  `json:"options"`
+
+	PriceEndpoints []ImagePriceEndpoint `json:"-"`
+	PricingStale   bool                 `json:"-"`
+	TextInputPrice float64              `json:"-"`
 }
 
 var (
@@ -116,6 +121,10 @@ func LoadModels() error {
 				case "input_references":
 					if parameter.Type == openingrouter.ImageCapabilityTypeRange && parameter.Max != nil {
 						options.MaxReferences = int(*parameter.Max)
+
+						if parameter.Min != nil {
+							options.MinReferences = int(*parameter.Min)
+						}
 					}
 				}
 			}
@@ -130,9 +139,15 @@ func LoadModels() error {
 			Options: options,
 		}
 
+		if model.Endpoint.Pricing != nil {
+			m.TextInputPrice = float64(model.Endpoint.Pricing.Prompt)
+		}
+
 		newList = append(newList, m)
 		newMap[m.ID] = m
 	}
+
+	loadImagePricing(newList)
 
 	log.Printf("Loaded %d models\n", len(newList))
 

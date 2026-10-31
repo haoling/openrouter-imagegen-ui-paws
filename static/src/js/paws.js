@@ -104,7 +104,8 @@ try {
 	throw error;
 }
 
-const executions = new Map();
+const executions = new Map(),
+	referenceSizeCache = new WeakMap();
 
 let referenceImages = load("referenceImages", []),
 	jobs = await loadJobs(),
@@ -134,6 +135,8 @@ let referenceImages = load("referenceImages", []),
 	draggedJobCard = null,
 	releaseDrag = null,
 	costEstimateSeq = 0,
+	costEstimateTimer = null,
+	costEstimateController = null,
 	gallery = null;
 
 $useDefaultSystem.checked = useDefaultSys;
@@ -534,6 +537,10 @@ function updateAvailableOptions() {
 		...(Array.isArray(options.aspect_ratios) ? options.aspect_ratios.filter((ratio) => ratio !== "auto") : []),
 	];
 
+	resDropdown = extendEstimateOptions($resolution, resolutions, resDropdown);
+	aspectDropdown = extendEstimateOptions($aspectRatio, aspectRatios, aspectDropdown);
+	qualityDropdown = extendEstimateOptions($quality, qualities, qualityDropdown);
+
 	resDropdown.setAvailable(resolutions);
 	aspectDropdown.setAvailable(aspectRatios);
 	qualityDropdown.setAvailable(qualities);
@@ -545,117 +552,142 @@ function updateAvailableOptions() {
 	updateResolutionEstimate();
 }
 
+function extendEstimateOptions(select, values, current) {
+	const missing = values.filter(value => !Array.from(select.options).some(option => option.value === value));
+
+	if (!missing.length) {
+		return current;
+	}
+
+	for (const value of missing) {
+		select.add(new Option(value, value));
+	}
+
+	return dropdown(select);
+}
+
 function updateResolutionEstimate() {
-	const $costSpan = document.getElementById("resolution-estimate-cost");
+	const $costSpan = document.getElementById("resolution-estimate-cost"),
+		seq = ++costEstimateSeq;
+
+	clearTimeout(costEstimateTimer);
+	costEstimateController?.abort();
 
 	if (!$costSpan) {
 		return;
 	}
 
-	fetchCostEstimate($costSpan);
+	hideCostEstimate($costSpan);
+
+	costEstimateTimer = setTimeout(() => fetchCostEstimate($costSpan, seq), 250);
 }
 
-async function fetchCostEstimate($costSpan) {
-	const model = $model.value;
+async function referenceImageSize(item, max) {
+	const source = item.processed || item.original;
 
-	if (!model) {
-		hideCostEstimate($costSpan);
+	let cached = referenceSizeCache.get(item);
 
+	if (cached?.source !== source) {
+		cached = { source, promise: assetInfo(source) };
+
+		referenceSizeCache.set(item, cached);
+	}
+
+	try {
+		const info = await cached.promise;
+
+		if (!info || !Number.isFinite(info.width) || !Number.isFinite(info.height) || info.width <= 0 || info.height <= 0) {
+			throw new Error(`Missing image dimensions: ${source}`);
+		}
+
+		const scale = max > 0 ? Math.min(1, max / Math.max(info.width, info.height)) : 1;
+
+		return {
+			width: Math.max(1, Math.round(info.width * scale)),
+			height: Math.max(1, Math.round(info.height * scale)),
+		};
+	} catch (error) {
+		if (referenceSizeCache.get(item) === cached) {
+			referenceSizeCache.delete(item);
+		}
+
+		throw error;
+	}
+}
+
+async function fetchCostEstimate($costSpan, seq) {
+	const request = {
+		model: $model.value,
+		quality: $quality.value,
+		aspect: $aspectRatio.value,
+		resolution: $resolution.value,
+		prompt: $prompt.value,
+		system: $systemMessage.value,
+	};
+
+	if (!request.model || seq !== costEstimateSeq) {
 		return;
 	}
 
-	const seq = ++costEstimateSeq;
+	const controller = new AbortController();
+	costEstimateController = controller;
 
-	const references = [];
-
-	for (const item of referenceImages) {
-		const size = await imageSize(item.processed || item.original);
+	try {
+		const max = Number($maxRefResolution.value),
+			references = await Promise.all(referenceImages.map(item => referenceImageSize(item, max)));
 
 		if (seq !== costEstimateSeq) {
 			return;
 		}
 
-		if (size.width > 0 && size.height > 0) {
-			references.push(size);
-		}
-	}
-
-	let response;
-
-	try {
-		response = await fetch("/-/cost", {
+		const response = await fetch("/-/cost", {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				model: model,
-				quality: $quality.value,
-				aspect: $aspectRatio.value,
-				resolution: $resolution.value,
-				references: references,
-			}),
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ...request, references }),
+			signal: controller.signal,
 		});
-	} catch (err) {
-		console.error("Failed to fetch cost estimate", err);
+
+		const data = await response.json();
+
+		if (seq !== costEstimateSeq) {
+			return;
+		}
+
+		const available = response.ok && data.available !== false && Number.isFinite(data.estimate) && data.estimate >= 0;
+
+		if (available) {
+			const range = Number.isFinite(data.maximum) && data.maximum > data.estimate
+				? `–${formatMoney(data.maximum)}`
+				: "";
+
+			$costSpan.textContent = `~${formatMoney(data.estimate)}${range}`;
+		} else {
+			$costSpan.textContent = "unavailable";
+		}
+
+		$costSpan.title = [
+			data.source === "fallback" ? "Fallback estimate." : "Estimated cost for one image.",
+			...(data.notes || []),
+			data.error || "",
+		].filter(Boolean).join("\n");
+
+		document.getElementById("resolution-estimate")?.classList.remove("hidden");
+	} catch (error) {
+		if (error.name !== "AbortError") {
+			console.error("Failed to fetch cost estimate", error);
+		}
 
 		if (seq === costEstimateSeq) {
 			hideCostEstimate($costSpan);
 		}
-
-		return;
 	}
-
-	if (seq !== costEstimateSeq) {
-		return;
-	}
-
-	if (!response.ok) {
-		hideCostEstimate($costSpan);
-
-		return;
-	}
-
-	const data = await response.json().catch(() => null);
-
-	if (seq !== costEstimateSeq) {
-		return;
-	}
-
-	if (data?.estimate != null && data.estimate > 0) {
-		$costSpan.textContent = `~${formatMoney(data.estimate)}`;
-
-		const $container = document.getElementById("resolution-estimate");
-
-		if ($container) {
-			$container.classList.remove("hidden");
-		}
-
-		return;
-	}
-
-	hideCostEstimate($costSpan);
 }
 
 function hideCostEstimate($costSpan) {
-	const $container = document.getElementById("resolution-estimate");
-
-	if ($container) {
-		$container.classList.add("hidden");
-	}
+	document.getElementById("resolution-estimate")?.classList.add("hidden");
 
 	$costSpan.textContent = "";
-}
-
-async function imageSize(id) {
-	const info = await assetInfo(id),
-		max = Number($maxRefResolution.value),
-		scale = max > 0 ? Math.min(1, max / Math.max(info.width, info.height)) : 1;
-
-	return {
-		width: Math.max(1, Math.round(info.width * scale)),
-		height: Math.max(1, Math.round(info.height * scale)),
-	};
+	$costSpan.title = "";
 }
 
 function setComposerPane(pane, persist = true) {
@@ -1985,12 +2017,16 @@ $useDefaultSystem.addEventListener("change", event => {
 
 	store("system", $systemMessage.value);
 
+	updateResolutionEstimate();
+
 	if (!isApplyingPreset) {
 		syncPresetSelection();
 	}
 });
 
 $systemMessage.addEventListener("input", () => {
+	updateResolutionEstimate();
+
 	if (!useDefaultSys) {
 		store("customSystem", $systemMessage.value);
 		store("system", $systemMessage.value);
@@ -2002,6 +2038,8 @@ $systemMessage.addEventListener("input", () => {
 });
 
 $prompt.addEventListener("input", () => {
+	updateResolutionEstimate();
+
 	store("prompt", $prompt.value);
 
 	if (!isApplyingPreset) {

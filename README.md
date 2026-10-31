@@ -29,6 +29,14 @@ paws is a private, self-hosted web interface for generating images via AI models
 - **Usage Tracking**: Keep track of your spending with a clickable usage display that cycles through daily, weekly, monthly and total costs.
 - **Download & Retry**: Easily download high-resolution results or retry failed generations.
 
+### Cost Estimates
+
+The estimate uses OpenRouter's per-provider image pricing, refreshed with the model catalog. It accounts for resolution and quality tiers, prompt/system text, reference images, request fees, and model-specific token or megapixel billing. New models with per-image prices are supported automatically. Dropdown badges use a square image, medium/auto quality, and the minimum required references.
+
+Hover over the estimate for assumptions. Provider differences appear as a price range. Automatic dimensions/quality, text tokenization, reference processing, and dynamic processing charges remain estimates; the usage returned after generation is the actual cost. If a refresh fails, paws retains previous rates or labels its built-in fallback. Missing pricing is shown as unavailable, not free.
+
+`POST /-/cost` accepts `model`, `resolution`, `aspect`, `quality`, `prompt`, `system`, and reference dimensions in `references`. An optional `output_tokens` budget supports token-billed models without a known output formula. The response includes `estimate`, `available`, `maximum` (when providers differ), `source`, and explanatory `notes`. The estimate is for one image; it does not call the generation API.
+
 ## Built With
 
 **Frontend**

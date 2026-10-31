@@ -60,10 +60,7 @@ func (r *ChatRequest) Parse() (*openingrouter.ImageGenerationRequest, error) {
 
 	request.Prompt = prompt
 
-	resolution, ok := openingrouter.IsValidImageResolution(r.Image.Resolution)
-	if !ok {
-		return nil, fmt.Errorf("invalid resolution %q", r.Image.Resolution)
-	}
+	resolution := openingrouter.ImageResolution(r.Image.Resolution)
 
 	if len(model.Options.Resolutions) > 0 {
 		request.Resolution = resolution
@@ -73,10 +70,7 @@ func (r *ChatRequest) Parse() (*openingrouter.ImageGenerationRequest, error) {
 		}
 	}
 
-	aspect, ok := openingrouter.IsValidImageAspectRatio(r.Image.Aspect)
-	if !ok {
-		return nil, fmt.Errorf("invalid aspect ratio %q", r.Image.Aspect)
-	}
+	aspect := openingrouter.ImageAspectRatio(r.Image.Aspect)
 
 	if aspect != openingrouter.ImageAspectRatioAuto && len(model.Options.AspectRatios) > 0 {
 		request.AspectRatio = aspect
@@ -86,17 +80,18 @@ func (r *ChatRequest) Parse() (*openingrouter.ImageGenerationRequest, error) {
 		}
 	}
 
-	quality, ok := openingrouter.IsValidImageQuality(r.Image.Quality)
-	if !ok {
-		return nil, fmt.Errorf("invalid quality %q", r.Image.Quality)
-	}
+	quality := openingrouter.ImageQuality(r.Image.Quality)
 
 	if len(model.Options.Qualities) > 0 {
 		request.Quality = quality
 
 		if !slices.Contains(model.Options.Qualities, string(request.Quality)) {
-			return nil, fmt.Errorf("model does not support aspect ratio %q", request.AspectRatio)
+			return nil, fmt.Errorf("model does not support quality %q", request.Quality)
 		}
+	}
+
+	if len(r.Images) < model.Options.MinReferences {
+		return nil, fmt.Errorf("model requires at least %d reference images", model.Options.MinReferences)
 	}
 
 	if len(r.Images) > model.Options.MaxReferences {

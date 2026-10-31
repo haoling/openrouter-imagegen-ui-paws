@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -23,11 +25,14 @@ const (
 )
 
 type EstimateRequest struct {
-	Model      string          `json:"model"`
-	Quality    string          `json:"quality"`
-	Aspect     string          `json:"aspect"`
-	Resolution string          `json:"resolution"`
-	References []ReferenceSize `json:"references"`
+	Model        string          `json:"model"`
+	Prompt       string          `json:"prompt"`
+	System       string          `json:"system"`
+	OutputTokens *int            `json:"output_tokens,omitempty"`
+	Quality      string          `json:"quality"`
+	Aspect       string          `json:"aspect"`
+	Resolution   string          `json:"resolution"`
+	References   []ReferenceSize `json:"references"`
 }
 
 type ReferenceSize struct {
@@ -36,7 +41,11 @@ type ReferenceSize struct {
 }
 
 type EstimateResponse struct {
-	Estimate float64 `json:"estimate"`
+	Estimate  float64  `json:"estimate"`
+	Available bool     `json:"available"`
+	Maximum   float64  `json:"maximum,omitempty"`
+	Source    string   `json:"source"`
+	Notes     []string `json:"notes,omitempty"`
 }
 
 type imageTokenRates struct {
@@ -47,11 +56,14 @@ type imageTokenRates struct {
 
 var (
 	imageModelTokenRates = map[string]imageTokenRates{
-		"openai/gpt-image-2":      {ImageIn: 8, ImageOut: 30, TextIn: 5},
-		"openai/gpt-image-1":      {ImageIn: 10, ImageOut: 40, TextIn: 5},
-		"openai/gpt-image-1-mini": {ImageIn: 2.5, ImageOut: 8, TextIn: 2},
-		"openai/gpt-5-image":      {ImageIn: 10, ImageOut: 40, TextIn: 5},
-		"openai/gpt-5-image-mini": {ImageIn: 2.5, ImageOut: 8, TextIn: 2},
+		"openai/gpt-image-2":            {ImageIn: 8, ImageOut: 30, TextIn: 5},
+		"openai/gpt-image-2.5-sunburst": {ImageIn: 8, ImageOut: 30, TextIn: 5},
+		"openai/gpt-image-2.5-flare":    {ImageIn: 8, ImageOut: 30, TextIn: 5},
+		"openai/gpt-5.4-image-2":        {ImageIn: 8, ImageOut: 30, TextIn: 5},
+		"openai/gpt-image-1":            {ImageIn: 10, ImageOut: 40, TextIn: 5},
+		"openai/gpt-image-1-mini":       {ImageIn: 2.5, ImageOut: 8, TextIn: 2},
+		"openai/gpt-5-image":            {ImageIn: 10, ImageOut: 40, TextIn: 5},
+		"openai/gpt-5-image-mini":       {ImageIn: 2.5, ImageOut: 8, TextIn: 2},
 	}
 
 	gptImage2QualityAxis = map[string]int64{
@@ -85,120 +97,6 @@ var (
 	}
 )
 
-func HandleImageEstimate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-
-		return
-	}
-
-	var req EstimateRequest
-
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		RespondJson(w, http.StatusBadRequest, map[string]any{
-			"error": "invalid json",
-		})
-
-		return
-	}
-
-	if req.Model == "" {
-		RespondJson(w, http.StatusBadRequest, map[string]any{
-			"error": "model is required",
-		})
-
-		return
-	}
-
-	estimate, err := EstimateImageCost(req)
-	if err != nil {
-		RespondJson(w, http.StatusBadRequest, map[string]any{
-			"error": err.Error(),
-		})
-
-		return
-	}
-
-	RespondJson(w, http.StatusOK, EstimateResponse{
-		Estimate: roundUSD(estimate),
-	})
-}
-
-func EstimateImageCost(req EstimateRequest) (float64, error) {
-	if _, ok := imageModelTokenRates[req.Model]; ok {
-		if strings.Contains(req.Model, "gpt-image-2") {
-			return estimateGPTImage2(req), nil
-		}
-
-		return estimateGPTImage1Family(req), nil
-	}
-
-	return estimateFlatPriced(req), nil
-}
-
-func estimateGPTImage2(req EstimateRequest) float64 {
-	rates := imageModelTokenRates[req.Model]
-
-	width, height := resolveGPTImage2Size(req)
-
-	quality := req.Quality
-
-	if quality == "auto" {
-		quality = "medium"
-	}
-
-	outputTokens := gptImage2OutputTokens(width, height, quality)
-
-	var inputImageTokens int
-
-	for _, ref := range req.References {
-		if ref.Width > 0 && ref.Height > 0 {
-			inputImageTokens += gptImage2ReferenceTokens(ref.Width, ref.Height)
-		}
-	}
-
-	textTokens := 80 + len(req.References)
-
-	cost := float64(outputTokens)*rates.ImageOut/1000000 + float64(inputImageTokens)*rates.ImageIn/1000000 + float64(textTokens)*rates.TextIn/1000000
-
-	return cost
-}
-
-func estimateGPTImage1Family(req EstimateRequest) float64 {
-	rates := imageModelTokenRates[req.Model]
-
-	sizeKey := resolveGPTImage1Size(req)
-
-	quality := req.Quality
-	if quality == "auto" {
-		quality = "medium"
-	}
-
-	outputTokens := gptImage1OutputTokens[sizeKey][quality]
-
-	var inputImageTokens int
-
-	for _, ref := range req.References {
-		if ref.Width > 0 && ref.Height > 0 {
-			inputImageTokens += gptImage2ReferenceTokens(ref.Width, ref.Height)
-		}
-	}
-
-	textTokens := 80 + len(req.References)
-
-	return float64(outputTokens)*rates.ImageOut/1000000 + float64(inputImageTokens)*rates.ImageIn/1000000 + float64(textTokens)*rates.TextIn/1000000
-}
-
-func estimateFlatPriced(req EstimateRequest) float64 {
-	pricing := ImageModelPricing[req.Model]
-	if pricing == nil {
-		return 0
-	}
-
-	return pricing.forResolution(req.Resolution)
-}
-
 func (p *ImagePricing) forResolution(resolution string) float64 {
 	switch resolution {
 	case string(openingrouter.ImageResolution4K):
@@ -230,10 +128,129 @@ func (p *ImagePricing) forResolution(resolution string) float64 {
 	}
 }
 
+func HandleImageEstimate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	var req EstimateRequest
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		RespondJson(w, http.StatusBadRequest, map[string]any{
+			"error": "invalid json",
+		})
+
+		return
+	}
+
+	if req.Model == "" {
+		RespondJson(w, http.StatusBadRequest, map[string]any{
+			"error": "model is required",
+		})
+
+		return
+	}
+
+	estimate, err := EstimateImageCost(req)
+	if err != nil {
+		RespondJson(w, http.StatusBadRequest, map[string]any{
+			"error": err.Error(),
+		})
+
+		return
+	}
+
+	RespondJson(w, http.StatusOK, estimate)
+}
+
+func EstimateImageCost(req EstimateRequest) (EstimateResponse, error) {
+	model := GetModel(req.Model)
+	if model == nil {
+		return EstimateResponse{}, fmt.Errorf("unknown model: %q", req.Model)
+	}
+
+	if req.Quality == "" {
+		req.Quality = "auto"
+	}
+
+	if req.Aspect == "" {
+		req.Aspect = "auto"
+	}
+
+	if req.Resolution == "" {
+		req.Resolution = "1K"
+
+		if len(model.Options.Resolutions) > 0 {
+			req.Resolution = model.Options.Resolutions[0]
+		}
+	}
+
+	options := map[string]string{"resolution": req.Resolution, "quality": req.Quality, "aspect ratio": req.Aspect}
+
+	for name, value := range options {
+		var allowed []string
+
+		switch name {
+		case "resolution":
+			allowed = model.Options.Resolutions
+		case "quality":
+			allowed = model.Options.Qualities
+		case "aspect ratio":
+			allowed = model.Options.AspectRatios
+		}
+
+		if value != "auto" && len(allowed) > 0 && !slices.Contains(allowed, value) {
+			return EstimateResponse{}, fmt.Errorf("model does not support %s %q", name, value)
+		}
+	}
+
+	if len(req.References) < model.Options.MinReferences {
+		return EstimateResponse{}, fmt.Errorf("model requires at least %d reference images", model.Options.MinReferences)
+	}
+
+	if len(req.References) > model.Options.MaxReferences {
+		return EstimateResponse{}, fmt.Errorf("model only supports up to %d reference images", model.Options.MaxReferences)
+	}
+
+	if req.OutputTokens != nil && (*req.OutputTokens < 0 || *req.OutputTokens > 100000000) {
+		return EstimateResponse{}, fmt.Errorf("invalid output token budget")
+	}
+
+	for _, reference := range req.References {
+		if reference.Width <= 0 || reference.Height <= 0 || reference.Width > 65536 || reference.Height > 65536 {
+			return EstimateResponse{}, fmt.Errorf("invalid reference dimensions")
+		}
+	}
+
+	// Match ChatRequest.Parse: controls absent from the model are not sent.
+	if len(model.Options.Resolutions) == 0 {
+		req.Resolution = ""
+	}
+
+	if len(model.Options.Qualities) == 0 {
+		req.Quality = "auto"
+	}
+
+	if len(model.Options.AspectRatios) == 0 {
+		req.Aspect = "auto"
+	}
+
+	return estimateModelCost(req, model), nil
+}
+
 func resolveGPTImage2Size(req EstimateRequest) (int, int) {
 	rw, rh, explicit := parseAspect(req.Aspect)
 
 	longEdge := 1024
+
+	if rw != rh || !explicit {
+		longEdge = 1536
+	}
 
 	switch req.Resolution {
 	case string(openingrouter.ImageResolution4K):
@@ -299,14 +316,14 @@ func parseAspect(aspect string) (int, int, bool) {
 		return 0, 0, false
 	}
 
-	w, errW := strconv.Atoi(parts[0])
-	h, errH := strconv.Atoi(parts[1])
+	width, errW := strconv.ParseFloat(parts[0], 64)
+	height, errH := strconv.ParseFloat(parts[1], 64)
 
-	if errW != nil || errH != nil || w <= 0 || h <= 0 {
+	if errW != nil || errH != nil || math.IsNaN(width) || math.IsNaN(height) || width < 0.01 || height < 0.01 || width > 1000 || height > 1000 {
 		return 0, 0, false
 	}
 
-	return w, h, true
+	return int(math.Round(width * 100)), int(math.Round(height * 100)), true
 }
 
 func aspectFromReferences(refs []ReferenceSize) (int, int, bool) {
@@ -379,8 +396,7 @@ func normalizeGPTImage2Size(width, height int) (int, int) {
 	return width, height
 }
 
-func gptImage2OutputTokens(width, height int, quality string) int {
-	q := gptImage2QualityAxis[quality]
+func gptImageOutputTokens(width, height int, q int64) int {
 	if q == 0 {
 		q = gptImage2QualityAxis["medium"]
 	}
@@ -391,8 +407,8 @@ func gptImage2OutputTokens(width, height int, quality string) int {
 	longEdge := max(w, h)
 	shortEdge := min(w, h)
 
-	// round-half-up(q * short / long)
-	shortAxis := (2*q*shortEdge + longEdge) / (2 * longEdge)
+	// Match OpenAI's published output-token calculator (ties to even).
+	shortAxis := int64(math.RoundToEven(float64(q) * float64(shortEdge) / float64(longEdge)))
 
 	// ceil(q * shortAxis * (2,000,000 + w*h) / 4,000,000)
 	numerator := q * shortAxis * (2000000 + w*h)
@@ -465,5 +481,5 @@ func ceilUnit(v float64) int {
 }
 
 func roundUSD(v float64) float64 {
-	return math.Round(v*10000) / 10000
+	return math.Round(v*1000000) / 1000000
 }
