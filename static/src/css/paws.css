@@ -190,6 +190,7 @@ body {
 
 .resolution-estimate {
 	font-size: 12px;
+	line-height: 18px;
 	font-weight: 500;
 	color: var(--c-overlay2);
 	margin-top: 2px;
@@ -197,6 +198,8 @@ body {
 	display: flex;
 	align-items: center;
 	gap: 4px;
+	min-width: 0;
+	white-space: nowrap;
 }
 
 .resolution-estimate span {
@@ -204,7 +207,18 @@ body {
 	color: var(--c-subtext1);
 }
 
+.resolution-estimate span:first-child {
+	flex-shrink: 0;
+}
+
 #resolution-estimate-cost {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	color: var(--c-overlay2);
+}
+
+#resolution-estimate-cost[data-state="ready"] {
 	color: var(--c-teal);
 }
 

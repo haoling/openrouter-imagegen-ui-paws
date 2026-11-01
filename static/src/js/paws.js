@@ -577,7 +577,13 @@ function updateResolutionEstimate() {
 		return;
 	}
 
-	hideCostEstimate($costSpan);
+	if (!$model.value) {
+		setCostEstimate($costSpan, "idle", "select a model");
+
+		return;
+	}
+
+	setCostEstimate($costSpan, "loading", "calculating...");
 
 	costEstimateTimer = setTimeout(() => fetchCostEstimate($costSpan, seq), 250);
 }
@@ -655,39 +661,36 @@ async function fetchCostEstimate($costSpan, seq) {
 
 		const available = response.ok && data.available !== false && Number.isFinite(data.estimate) && data.estimate >= 0;
 
-		if (available) {
-			const range = Number.isFinite(data.maximum) && data.maximum > data.estimate
-				? `–${formatMoney(data.maximum)}`
-				: "";
-
-			$costSpan.textContent = `~${formatMoney(data.estimate)}${range}`;
-		} else {
-			$costSpan.textContent = "unavailable";
-		}
-
-		$costSpan.title = [
+		const title = [
 			data.source === "fallback" ? "Fallback estimate." : "Estimated cost for one image.",
 			...(data.notes || []),
 			data.error || "",
 		].filter(Boolean).join("\n");
 
-		document.getElementById("resolution-estimate")?.classList.remove("hidden");
+		if (available) {
+			const range = Number.isFinite(data.maximum) && data.maximum > data.estimate
+				? `–${formatMoney(data.maximum)}`
+				: "";
+
+			setCostEstimate($costSpan, "ready", `~${formatMoney(data.estimate)}${range}`, title);
+		} else {
+			setCostEstimate($costSpan, "unavailable", "unavailable", title);
+		}
 	} catch (error) {
 		if (error.name !== "AbortError") {
 			console.error("Failed to fetch cost estimate", error);
 		}
 
 		if (seq === costEstimateSeq) {
-			hideCostEstimate($costSpan);
+			setCostEstimate($costSpan, "unavailable", "unavailable", "Could not fetch the cost estimate.");
 		}
 	}
 }
 
-function hideCostEstimate($costSpan) {
-	document.getElementById("resolution-estimate")?.classList.add("hidden");
-
-	$costSpan.textContent = "";
-	$costSpan.title = "";
+function setCostEstimate($costSpan, state, text, title = "") {
+	$costSpan.dataset.state = state;
+	$costSpan.textContent = text;
+	$costSpan.title = title;
 }
 
 function setComposerPane(pane, persist = true) {
